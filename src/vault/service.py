@@ -1,31 +1,34 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
 from typing import Any
 
-from vault.address_book import AddressBookManager
+from vault.address_book import AddressBookManager, normalize_address
 from vault.config import (
     DEFAULT_PROFILES,
+    NotFoundError,
     VaultError,
     ValidationError,
     load_json,
+    path_is_within_git_worktree,
     resolve_paths,
     resolve_root_home,
     save_json,
     set_active_profile_name,
 )
-from vault.erc4337 import ERC4337Client
-from vault.evm import EVMClient
-from vault.journal import JournalManager
+from vault.evm import EVMClient, format_units
+from vault.journal import JournalManager, normalize_tx_hash
 from vault.keystore import KeystoreManager, copy_account_file, now_iso
+from vault.monitor import MonitorStateManager
 from vault.networks import NetworkManager, copy_network_record
 from vault.policy import PolicyManager
-from vault.safe import SAFE_TRANSACTION_SENTINEL, SafeClient
 from vault.signers import resolve_signer
-from vault.smart_accounts import SmartAccountManager
 from vault.themes import DEFAULT_THEME_NAME, normalize_theme_name, theme_rows
 
 
 MAINNET_CHAIN_IDS = {1, 10, 137, 8453, 42161}
+MAX_MONITOR_CACHE = 200
 
 
 class VaultService:
@@ -70,11 +73,9 @@ class VaultService:
     def context_summary(self) -> dict[str, Any]:
         accounts_payload = self._accounts().list_accounts()
         networks_payload = self._networks().list_networks()
-        smart_payload = self._smart_accounts().list_accounts()
         config = load_json(self.paths.config_file, {})
         default_account_name = accounts_payload.get("default_account")
         default_network_name = networks_payload.get("default_network")
-        default_smart_name = smart_payload.get("default_smart_account")
         default_account = next(
             (item for item in accounts_payload["accounts"] if item["name"] == default_account_name),
             None,
@@ -83,21 +84,19 @@ class VaultService:
             (item for item in networks_payload["networks"] if item["name"] == default_network_name),
             None,
         )
-        default_smart_account = next(
-            (item for item in smart_payload["accounts"] if item["name"] == default_smart_name),
-            None,
-        )
+        safety = self.safety_status()
+        has_safety_issues = bool(safety["findings"] and safety["findings"][0] != "No immediate safety issues detected.")
         return {
             "summary": f"Context for {self.profile_name}",
             "profile": self.profile_name,
             "is_protected_profile": self.profile_name == "prod",
             "default_account": default_account,
             "default_network": default_network,
-            "default_smart_account": default_smart_account,
             "account_count": accounts_payload["count"],
             "network_count": networks_payload["count"],
-            "smart_account_count": smart_payload["count"],
             "theme": normalize_theme_name(config.get("theme", DEFAULT_THEME_NAME)),
+            "safety_state": "warning" if has_safety_issues else "ok",
+            "safety_findings": safety["findings"],
         }
 
     def use_profile(self, name: str) -> dict[str, Any]:
@@ -137,8 +136,7 @@ class VaultService:
 
     def use_theme(self, name: str) -> dict[str, Any]:
         config = load_json(self.paths.config_file, {})
-        normalized = normalize_theme_name(name)
-        config["theme"] = normalized
+        config["theme"] = normalize_theme_name(name)
         save_json(self.paths.config_file, config)
         return self.show_theme()
 
@@ -220,139 +218,6 @@ class VaultService:
         payload["profile"] = self.profile_name
         return payload
 
-    def list_smart_accounts(self) -> dict[str, Any]:
-        payload = self._smart_accounts().list_accounts()
-        payload["profile"] = self.profile_name
-        return payload
-
-    def show_smart_account(self, name: str | None = None) -> dict[str, Any]:
-        payload = self._smart_accounts().get_account(name)
-        payload["summary"] = f"Smart account {payload['name']}"
-        payload["profile"] = self.profile_name
-        return payload
-
-    def use_smart_account(self, name: str) -> dict[str, Any]:
-        payload = self._smart_accounts().set_default_account(name)
-        payload["profile"] = self.profile_name
-        return payload
-
-    def register_safe_account(
-        self,
-        name: str,
-        address: str,
-        network_name: str,
-        service_url: str | None = None,
-        entrypoint: str | None = None,
-        set_default: bool = False,
-    ) -> dict[str, Any]:
-        network = self._networks().get_network(network_name)
-        info = SafeClient(network, service_url=service_url).get_safe_info(address)
-        payload = self._smart_accounts().register_safe(
-            name=name,
-            address=info["address"],
-            network=network["name"],
-            owners=info["owners"],
-            threshold=info["threshold"],
-            service_url=service_url,
-            entrypoint=entrypoint,
-            set_default=set_default,
-        )
-        payload["profile"] = self.profile_name
-        payload["nonce"] = info["nonce"]
-        return payload
-
-    def create_safe_account(
-        self,
-        signer_account: str,
-        passphrase: str,
-        network_name: str,
-        singleton: str,
-        factory: str,
-        fallback_handler: str,
-        owners: list[str],
-        threshold: int,
-        salt_nonce: int,
-    ) -> dict[str, Any]:
-        signer = self._resolve_account_metadata(signer_account)
-        network = self._networks().get_network(network_name)
-        payload = SafeClient(network).create_safe(
-            signer_paths=self.paths,
-            signer_metadata=signer,
-            passphrase=passphrase,
-            singleton=singleton,
-            factory=factory,
-            fallback_handler=fallback_handler,
-            owners=owners,
-            threshold=threshold,
-            salt_nonce=salt_nonce,
-        )
-        payload["profile"] = self.profile_name
-        self._journal().record_event(
-            payload["transaction_hash"],
-            "safe_create",
-            {
-                "status": "submitted",
-                "profile": self.profile_name,
-                "network": network["name"],
-                "smart_account": None,
-                "created_at": now_iso(),
-                "payload": payload,
-            },
-        )
-        return payload
-
-    def sync_safe_account(self, name: str | None = None) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        network = self._networks().get_network(config["network"])
-        info = SafeClient(network, service_url=config.get("service_url")).get_safe_info(config["address"])
-        payload = self._smart_accounts().update_account(
-            config["name"],
-            {
-                "owners": info["owners"],
-                "threshold": info["threshold"],
-            },
-        )
-        payload["profile"] = self.profile_name
-        payload["nonce"] = info["nonce"]
-        return payload
-
-    def register_erc4337_account(
-        self,
-        name: str,
-        sender: str,
-        network_name: str,
-        owner_account: str,
-        entrypoint: str,
-        version: str = "0.6",
-        factory: str | None = None,
-        factory_data: str | None = None,
-        bundler_url: str | None = None,
-        paymaster_url: str | None = None,
-        set_default: bool = False,
-    ) -> dict[str, Any]:
-        network = self._networks().get_network(network_name)
-        self._resolve_account_metadata(owner_account)
-        payload = self._smart_accounts().register_erc4337(
-            name=name,
-            sender=sender,
-            network=network["name"],
-            owner_account=owner_account,
-            entrypoint=entrypoint,
-            version=version,
-            factory=factory,
-            factory_data=factory_data,
-            bundler_url=bundler_url,
-            paymaster_url=paymaster_url,
-            set_default=set_default,
-        )
-        payload["profile"] = self.profile_name
-        return payload
-
-    def remove_smart_account(self, name: str) -> dict[str, Any]:
-        payload = self._smart_accounts().remove_account(name)
-        payload["profile"] = self.profile_name
-        return payload
-
     def list_address_book(self) -> dict[str, Any]:
         payload = self._address_book().list_entries()
         payload["profile"] = self.profile_name
@@ -379,8 +244,8 @@ class VaultService:
         payload["profile"] = self.profile_name
         return payload
 
-    def show_journal_entry(self, tx_hash: str) -> dict[str, Any]:
-        payload = self._journal().get_entry(tx_hash)
+    def show_journal_entry(self, entry_id: str) -> dict[str, Any]:
+        payload = self._journal().get_entry(entry_id)
         payload["profile"] = self.profile_name
         return payload
 
@@ -427,308 +292,6 @@ class VaultService:
     def sign_typed_data(self, account_name: str | None, passphrase: str, typed_data: dict[str, Any]) -> dict[str, Any]:
         signer = self._resolve_signer(account_name)
         payload = signer.sign_typed_data(passphrase, typed_data)
-        payload["profile"] = self.profile_name
-        return payload
-
-    def list_safe_pending_transactions(self, name: str | None = None) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        network = self._networks().get_network(config["network"])
-        payload = SafeClient(network, service_url=config.get("service_url")).list_pending_transactions(config["address"])
-        payload["profile"] = self.profile_name
-        payload["smart_account"] = config["name"]
-        return payload
-
-    def show_safe_pending_transaction(self, safe_tx_hash: str, name: str | None = None) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        network = self._networks().get_network(config["network"])
-        payload = SafeClient(network, service_url=config.get("service_url")).get_pending_transaction(safe_tx_hash)
-        payload["profile"] = self.profile_name
-        payload["smart_account"] = config["name"]
-        return payload
-
-    def propose_safe_transaction(
-        self,
-        name: str | None,
-        signer_account: str,
-        passphrase: str,
-        to: str,
-        value: str = "0",
-        data: str = "0x",
-        operation: int = 0,
-        nonce: int | None = None,
-        origin: str | None = None,
-    ) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        signer = self._resolve_account_metadata(signer_account)
-        self._ensure_safe_owner(config, signer["name"])
-        network = self._networks().get_network(config["network"])
-        self._enforce_smart_policy(
-            account_name=signer["name"],
-            network=network,
-            recipient=to,
-            amount=value,
-            token_address=None,
-        )
-        payload = SafeClient(network, service_url=config.get("service_url")).propose_transaction(
-            safe_config=config,
-            signer_paths=self.paths,
-            proposer_metadata=signer,
-            passphrase=passphrase,
-            to=to,
-            value_wei=int(value),
-            data=data,
-            operation=operation,
-            nonce=nonce,
-            origin=origin,
-        )
-        payload["profile"] = self.profile_name
-        payload["smart_account"] = config["name"]
-        self._journal().record_event(
-            payload["safe_tx_hash"],
-            "safe_proposal",
-            {
-                "status": "proposed",
-                "profile": self.profile_name,
-                "network": network["name"],
-                "smart_account": config["name"],
-                "created_at": now_iso(),
-                "payload": payload,
-            },
-        )
-        return payload
-
-    def propose_safe_add_owner(
-        self,
-        name: str | None,
-        signer_account: str,
-        passphrase: str,
-        owner_address: str,
-        threshold: int | None = None,
-        nonce: int | None = None,
-    ) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        network = self._networks().get_network(config["network"])
-        safe_client = SafeClient(network, service_url=config.get("service_url"))
-        data = safe_client.encode_add_owner(owner_address, threshold or config["threshold"])
-        return self.propose_safe_transaction(
-            name=config["name"],
-            signer_account=signer_account,
-            passphrase=passphrase,
-            to=config["address"],
-            value="0",
-            data=data,
-            operation=0,
-            nonce=nonce,
-            origin="vault:add-owner",
-        )
-
-    def propose_safe_remove_owner(
-        self,
-        name: str | None,
-        signer_account: str,
-        passphrase: str,
-        prev_owner: str,
-        owner_address: str,
-        threshold: int,
-        nonce: int | None = None,
-    ) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        network = self._networks().get_network(config["network"])
-        safe_client = SafeClient(network, service_url=config.get("service_url"))
-        data = safe_client.encode_remove_owner(prev_owner, owner_address, threshold)
-        return self.propose_safe_transaction(
-            name=config["name"],
-            signer_account=signer_account,
-            passphrase=passphrase,
-            to=config["address"],
-            value="0",
-            data=data,
-            operation=0,
-            nonce=nonce,
-            origin="vault:remove-owner",
-        )
-
-    def propose_safe_change_threshold(
-        self,
-        name: str | None,
-        signer_account: str,
-        passphrase: str,
-        threshold: int,
-        nonce: int | None = None,
-    ) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        network = self._networks().get_network(config["network"])
-        safe_client = SafeClient(network, service_url=config.get("service_url"))
-        data = safe_client.encode_change_threshold(threshold)
-        return self.propose_safe_transaction(
-            name=config["name"],
-            signer_account=signer_account,
-            passphrase=passphrase,
-            to=config["address"],
-            value="0",
-            data=data,
-            operation=0,
-            nonce=nonce,
-            origin="vault:change-threshold",
-        )
-
-    def confirm_safe_transaction(
-        self,
-        name: str | None,
-        signer_account: str,
-        passphrase: str,
-        safe_tx_hash: str,
-    ) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        signer = self._resolve_account_metadata(signer_account)
-        self._ensure_safe_owner(config, signer["name"])
-        network = self._networks().get_network(config["network"])
-        payload = SafeClient(network, service_url=config.get("service_url")).confirm_transaction(
-            signer_paths=self.paths,
-            signer_metadata=signer,
-            passphrase=passphrase,
-            safe_tx_hash=safe_tx_hash,
-        )
-        payload["profile"] = self.profile_name
-        payload["smart_account"] = config["name"]
-        self._journal().record_event(
-            safe_tx_hash,
-            "safe_confirmation",
-            {
-                "status": "confirmed",
-                "profile": self.profile_name,
-                "network": network["name"],
-                "smart_account": config["name"],
-                "created_at": now_iso(),
-                "payload": payload,
-            },
-        )
-        return payload
-
-    def execute_safe_transaction(
-        self,
-        name: str | None,
-        signer_account: str,
-        passphrase: str,
-        safe_tx_hash: str,
-    ) -> dict[str, Any]:
-        config = self._require_safe_account(name)
-        signer = self._resolve_account_metadata(signer_account)
-        self._ensure_safe_owner(config, signer["name"])
-        network = self._networks().get_network(config["network"])
-        pending = SafeClient(network, service_url=config.get("service_url")).get_pending_transaction(safe_tx_hash)
-        self._enforce_smart_policy(
-            account_name=signer["name"],
-            network=network,
-            recipient=pending["to"],
-            amount=str(int(pending["value"])),
-            token_address=None,
-        )
-        payload = SafeClient(network, service_url=config.get("service_url")).execute_transaction(
-            safe_config=config,
-            signer_paths=self.paths,
-            signer_metadata=signer,
-            passphrase=passphrase,
-            safe_tx_hash=safe_tx_hash,
-        )
-        payload["profile"] = self.profile_name
-        payload["smart_account"] = config["name"]
-        self._journal().record_event(
-            safe_tx_hash,
-            "safe_execution",
-            {
-                "status": "submitted",
-                "profile": self.profile_name,
-                "network": network["name"],
-                "smart_account": config["name"],
-                "created_at": now_iso(),
-                "payload": payload,
-            },
-        )
-        return payload
-
-    def prepare_user_operation(
-        self,
-        name: str | None,
-        to: str,
-        value: str = "0",
-        data: str = "0x",
-        nonce: str | None = None,
-        signature: str | None = None,
-    ) -> dict[str, Any]:
-        config = self._require_erc4337_account(name)
-        network = self._networks().get_network(config["network"])
-        payload = ERC4337Client(network, config, self.paths).prepare_user_operation(
-            to=to,
-            data=data,
-            value_wei=int(value),
-            nonce=nonce,
-            signature=signature,
-        )
-        payload["profile"] = self.profile_name
-        return payload
-
-    def simulate_user_operation(
-        self,
-        name: str | None,
-        user_operation: dict[str, Any],
-    ) -> dict[str, Any]:
-        config = self._require_erc4337_account(name)
-        network = self._networks().get_network(config["network"])
-        payload = ERC4337Client(network, config, self.paths).simulate_user_operation(user_operation)
-        payload["profile"] = self.profile_name
-        return payload
-
-    def sign_user_operation(
-        self,
-        name: str | None,
-        passphrase: str,
-        user_operation: dict[str, Any],
-    ) -> dict[str, Any]:
-        config = self._require_erc4337_account(name)
-        network = self._networks().get_network(config["network"])
-        payload = ERC4337Client(network, config, self.paths).sign_user_operation(user_operation, passphrase)
-        payload["profile"] = self.profile_name
-        return payload
-
-    def submit_user_operation(
-        self,
-        name: str | None,
-        user_operation: dict[str, Any],
-    ) -> dict[str, Any]:
-        config = self._require_erc4337_account(name)
-        network = self._networks().get_network(config["network"])
-        if not user_operation.get("signature") or user_operation["signature"] == "0x":
-            raise ValidationError("User operation must be signed before submission.")
-        self._enforce_smart_policy(
-            account_name=config["owner_account"],
-            network=network,
-            recipient=config["address"],
-            amount="0",
-            token_address=None,
-        )
-        simulation = ERC4337Client(network, config, self.paths).simulate_user_operation(user_operation)
-        payload = ERC4337Client(network, config, self.paths).submit_user_operation(user_operation)
-        payload["profile"] = self.profile_name
-        self._journal().record_event(
-            payload["user_operation_hash"],
-            "erc4337_submission",
-            {
-                "status": "submitted",
-                "profile": self.profile_name,
-                "network": network["name"],
-                "smart_account": config["name"],
-                "created_at": now_iso(),
-                "simulation": simulation,
-                "payload": payload,
-            },
-        )
-        return payload
-
-    def user_operation_status(self, name: str | None, user_operation_hash: str) -> dict[str, Any]:
-        config = self._require_erc4337_account(name)
-        network = self._networks().get_network(config["network"])
-        payload = ERC4337Client(network, config, self.paths).get_user_operation_status(user_operation_hash)
         payload["profile"] = self.profile_name
         return payload
 
@@ -806,18 +369,435 @@ class VaultService:
         payload["account_name"] = account["name"]
         return payload
 
+    def contract_read(
+        self,
+        target: str,
+        function_name: str,
+        abi_file: str | None = None,
+        abi_fragment: str | None = None,
+        args_json: str | None = None,
+        network_name: str | None = None,
+    ) -> dict[str, Any]:
+        network = self._networks().get_network(network_name)
+        resolved = self._resolve_lookup_target(target, network["name"])
+        abi, abi_source, abi_reference = self._load_abi(abi_file=abi_file, abi_fragment=abi_fragment)
+        args = self._parse_args_json(args_json)
+        payload = EVMClient(network).get_contract_read(
+            address=resolved["address"],
+            abi=abi,
+            function_name=function_name,
+            args=args,
+        )
+        payload.update(
+            {
+                "summary": f"Contract read for {payload['address']} on {network['name']}",
+                "profile": self.profile_name,
+                "network": network["name"],
+                "chain_id": network["chain_id"],
+                "query": resolved["query"],
+                "query_kind": resolved["query_kind"],
+                "abi_source": abi_source,
+                "abi_reference": abi_reference,
+                "function": function_name,
+                "args": args,
+            }
+        )
+        return payload
+
+    def preview_contract_write(
+        self,
+        from_account_name: str,
+        target: str,
+        function_name: str,
+        abi_file: str | None = None,
+        abi_fragment: str | None = None,
+        args_json: str | None = None,
+        value: str | None = None,
+        network_name: str | None = None,
+        nonce: int | None = None,
+        gas_limit: int | None = None,
+        gas_price_gwei: str | None = None,
+        max_fee_per_gas_gwei: str | None = None,
+        max_priority_fee_per_gas_gwei: str | None = None,
+    ) -> dict[str, Any]:
+        account = self._resolve_account_metadata(from_account_name)
+        network = self._networks().get_network(network_name)
+        resolved = self._resolve_lookup_target(target, network["name"])
+        abi, abi_source, abi_reference = self._load_abi(abi_file=abi_file, abi_fragment=abi_fragment)
+        args = self._parse_args_json(args_json)
+        prepared = EVMClient(network).prepare_contract_write(
+            from_address=account["address"],
+            contract_address=resolved["address"],
+            abi=abi,
+            function_name=function_name,
+            args=args,
+            value=value,
+            nonce=nonce,
+            gas_limit=gas_limit,
+            gas_price_gwei=gas_price_gwei,
+            max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+            max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
+        )
+        query_name = resolved["query"] if resolved["query_kind"] != "raw" else None
+        details = {
+            "kind": "contract_write",
+            "query": resolved["query"],
+            "query_kind": resolved["query_kind"],
+            "abi_source": abi_source,
+            "abi_reference": abi_reference,
+            "contract_function": function_name,
+            "args": args,
+            "value": prepared["value"],
+            "value_wei": prepared["value_wei"],
+        }
+        return self._finalize_prepared_transaction(
+            prepared=prepared,
+            account=account,
+            network=network,
+            query=resolved["query"],
+            query_kind=resolved["query_kind"],
+            recipient_name=query_name,
+            action="contract_write",
+            details=details,
+            policy_asset_type="contract",
+            policy_amount=prepared["value"],
+            policy_token_address=None,
+        )
+
+    def simulate_contract_write(
+        self,
+        from_account_name: str,
+        target: str,
+        function_name: str,
+        abi_file: str | None = None,
+        abi_fragment: str | None = None,
+        args_json: str | None = None,
+        value: str | None = None,
+        network_name: str | None = None,
+        nonce: int | None = None,
+        gas_limit: int | None = None,
+        gas_price_gwei: str | None = None,
+        max_fee_per_gas_gwei: str | None = None,
+        max_priority_fee_per_gas_gwei: str | None = None,
+    ) -> dict[str, Any]:
+        preview = self.preview_contract_write(
+            from_account_name=from_account_name,
+            target=target,
+            function_name=function_name,
+            abi_file=abi_file,
+            abi_fragment=abi_fragment,
+            args_json=args_json,
+            value=value,
+            network_name=network_name,
+            nonce=nonce,
+            gas_limit=gas_limit,
+            gas_price_gwei=gas_price_gwei,
+            max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+            max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
+        )
+        return self._simulate_prepared_transaction(preview, f"Simulation for {preview['network_name']}")
+
+    def execute_contract_write(
+        self,
+        passphrase: str,
+        preview: dict[str, Any] | None = None,
+        from_account_name: str | None = None,
+        target: str | None = None,
+        function_name: str | None = None,
+        abi_file: str | None = None,
+        abi_fragment: str | None = None,
+        args_json: str | None = None,
+        value: str | None = None,
+        network_name: str | None = None,
+        nonce: int | None = None,
+        gas_limit: int | None = None,
+        gas_price_gwei: str | None = None,
+        max_fee_per_gas_gwei: str | None = None,
+        max_priority_fee_per_gas_gwei: str | None = None,
+    ) -> dict[str, Any]:
+        if preview is None:
+            if not from_account_name or not target or not function_name:
+                raise ValidationError("From account, target, and function are required.")
+            preview = self.preview_contract_write(
+                from_account_name=from_account_name,
+                target=target,
+                function_name=function_name,
+                abi_file=abi_file,
+                abi_fragment=abi_fragment,
+                args_json=args_json,
+                value=value,
+                network_name=network_name,
+                nonce=nonce,
+                gas_limit=gas_limit,
+                gas_price_gwei=gas_price_gwei,
+                max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+                max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
+            )
+        return self._execute_prepared_transaction(passphrase, preview)
+
+    def token_allowance(
+        self,
+        token_target: str,
+        owner: str,
+        spender: str,
+        network_name: str | None = None,
+    ) -> dict[str, Any]:
+        network = self._networks().get_network(network_name)
+        token_resolution = self._resolve_lookup_target(token_target, network["name"])
+        owner_resolution = self._resolve_lookup_target(owner, network["name"])
+        spender_resolution = self._resolve_lookup_target(spender, network["name"])
+        payload = EVMClient(network).get_token_allowance(
+            token_address=token_resolution["address"],
+            owner=owner_resolution["address"],
+            spender=spender_resolution["address"],
+        )
+        payload.update(
+            {
+                "summary": f"Token allowance for {payload['token_address']} on {network['name']}",
+                "profile": self.profile_name,
+                "network": network["name"],
+                "chain_id": network["chain_id"],
+                "token_query": token_resolution["query"],
+                "token_query_kind": token_resolution["query_kind"],
+                "owner_query": owner_resolution["query"],
+                "owner_query_kind": owner_resolution["query_kind"],
+                "spender_query": spender_resolution["query"],
+                "spender_query_kind": spender_resolution["query_kind"],
+            }
+        )
+        return payload
+
+    def preview_token_approve(
+        self,
+        from_account_name: str,
+        token_target: str,
+        spender: str,
+        amount: str,
+        network_name: str | None = None,
+        nonce: int | None = None,
+        gas_limit: int | None = None,
+        gas_price_gwei: str | None = None,
+        max_fee_per_gas_gwei: str | None = None,
+        max_priority_fee_per_gas_gwei: str | None = None,
+    ) -> dict[str, Any]:
+        account = self._resolve_account_metadata(from_account_name)
+        network = self._networks().get_network(network_name)
+        token_resolution = self._resolve_lookup_target(token_target, network["name"])
+        spender_resolution = self._resolve_lookup_target(spender, network["name"])
+        prepared = EVMClient(network).prepare_token_approve(
+            from_address=account["address"],
+            token_address=token_resolution["address"],
+            spender_address=spender_resolution["address"],
+            amount=amount,
+            nonce=nonce,
+            gas_limit=gas_limit,
+            gas_price_gwei=gas_price_gwei,
+            max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+            max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
+        )
+        details = {
+            "kind": "token_approve",
+            "token_query": token_resolution["query"],
+            "token_query_kind": token_resolution["query_kind"],
+            "spender_query": spender_resolution["query"],
+            "spender_query_kind": spender_resolution["query_kind"],
+            "spender_address": spender_resolution["address"],
+            "amount": amount,
+            "amount_raw": prepared["amount_raw"],
+            "symbol": prepared["symbol"],
+            "decimals": prepared["decimals"],
+        }
+        query_name = spender_resolution["query"] if spender_resolution["query_kind"] != "raw" else None
+        payload = self._finalize_prepared_transaction(
+            prepared=prepared,
+            account=account,
+            network=network,
+            query=token_resolution["query"],
+            query_kind=token_resolution["query_kind"],
+            recipient_name=query_name,
+            action="token_approve",
+            details=details,
+            policy_asset_type="erc20",
+            policy_amount=amount,
+            policy_token_address=token_resolution["address"],
+        )
+        payload["spender_query"] = spender_resolution["query"]
+        payload["spender_query_kind"] = spender_resolution["query_kind"]
+        payload["spender_address"] = spender_resolution["address"]
+        return payload
+
+    def simulate_token_approve(
+        self,
+        from_account_name: str,
+        token_target: str,
+        spender: str,
+        amount: str,
+        network_name: str | None = None,
+        nonce: int | None = None,
+        gas_limit: int | None = None,
+        gas_price_gwei: str | None = None,
+        max_fee_per_gas_gwei: str | None = None,
+        max_priority_fee_per_gas_gwei: str | None = None,
+    ) -> dict[str, Any]:
+        preview = self.preview_token_approve(
+            from_account_name=from_account_name,
+            token_target=token_target,
+            spender=spender,
+            amount=amount,
+            network_name=network_name,
+            nonce=nonce,
+            gas_limit=gas_limit,
+            gas_price_gwei=gas_price_gwei,
+            max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+            max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
+        )
+        return self._simulate_prepared_transaction(preview, f"Simulation for {preview['network_name']}")
+
+    def execute_token_approve(
+        self,
+        passphrase: str,
+        preview: dict[str, Any] | None = None,
+        from_account_name: str | None = None,
+        token_target: str | None = None,
+        spender: str | None = None,
+        amount: str | None = None,
+        network_name: str | None = None,
+        nonce: int | None = None,
+        gas_limit: int | None = None,
+        gas_price_gwei: str | None = None,
+        max_fee_per_gas_gwei: str | None = None,
+        max_priority_fee_per_gas_gwei: str | None = None,
+    ) -> dict[str, Any]:
+        if preview is None:
+            if not from_account_name or not token_target or not spender or amount is None:
+                raise ValidationError("From account, token, spender, and amount are required.")
+            preview = self.preview_token_approve(
+                from_account_name=from_account_name,
+                token_target=token_target,
+                spender=spender,
+                amount=amount,
+                network_name=network_name,
+                nonce=nonce,
+                gas_limit=gas_limit,
+                gas_price_gwei=gas_price_gwei,
+                max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+                max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
+            )
+        return self._execute_prepared_transaction(passphrase, preview)
+
+    def lookup_address(self, target: str, network_name: str | None = None) -> dict[str, Any]:
+        network = self._networks().get_network(network_name)
+        resolved = self._resolve_lookup_target(target, network["name"])
+        client = EVMClient(network)
+        inspection = client.inspect_address(resolved["address"])
+        native_balance = client.get_native_balance(inspection["address"])
+        return {
+            "summary": f"Lookup address for {inspection['address']} on {network['name']}",
+            "profile": self.profile_name,
+            "network": network["name"],
+            "chain_id": network["chain_id"],
+            "query": resolved["query"],
+            "query_kind": resolved["query_kind"],
+            "address": inspection["address"],
+            "classification": inspection["classification"],
+            "nonce": inspection["nonce"],
+            "native_balance": {
+                "symbol": native_balance["symbol"],
+                "balance_wei": native_balance["balance_wei"],
+                "balance": native_balance["balance"],
+            },
+            "code_present": inspection["code_present"],
+            "code_size_bytes": inspection["code_size_bytes"],
+            "detected_interfaces": inspection["detected_interfaces"],
+            "proxy_hints": inspection["proxy_hints"],
+        }
+
+    def lookup_token(
+        self,
+        target: str,
+        network_name: str | None = None,
+        holder: str | None = None,
+    ) -> dict[str, Any]:
+        network = self._networks().get_network(network_name)
+        resolved = self._resolve_lookup_target(target, network["name"])
+        holder_resolution = self._resolve_lookup_target(holder, network["name"]) if holder else None
+        client = EVMClient(network)
+        inspection = client.inspect_token(
+            resolved["address"],
+            holder=holder_resolution["address"] if holder_resolution else None,
+        )
+        payload = {
+            "summary": f"Lookup token for {inspection['address']} on {network['name']}",
+            "profile": self.profile_name,
+            "network": network["name"],
+            "chain_id": network["chain_id"],
+            "query": resolved["query"],
+            "query_kind": resolved["query_kind"],
+            "address": inspection["address"],
+            "token_standard": inspection["token_standard"],
+            "name": inspection["name"],
+            "symbol": inspection["symbol"],
+            "decimals": inspection["decimals"],
+            "total_supply": inspection["total_supply"],
+            "is_contract": inspection["is_contract"],
+            "code_size_bytes": inspection["code_size_bytes"],
+            "detected_interfaces": inspection["detected_interfaces"],
+            "proxy_hints": inspection["proxy_hints"],
+        }
+        if inspection.get("metadata_uri") is not None:
+            payload["metadata_uri"] = inspection["metadata_uri"]
+        if holder_resolution:
+            holder_payload = dict(inspection.get("holder") or {})
+            holder_payload.update(
+                {
+                    "query": holder_resolution["query"],
+                    "query_kind": holder_resolution["query_kind"],
+                    "address": holder_payload.get("address") or holder_resolution["address"],
+                }
+            )
+            payload["holder"] = holder_payload
+        return payload
+
+    def lookup_contract(self, target: str, network_name: str | None = None) -> dict[str, Any]:
+        network = self._networks().get_network(network_name)
+        resolved = self._resolve_lookup_target(target, network["name"])
+        client = EVMClient(network)
+        inspection = client.inspect_contract(resolved["address"])
+        token_hints = inspection.get("token_hints") or {}
+        payload = {
+            "summary": f"Lookup contract for {inspection['address']} on {network['name']}",
+            "profile": self.profile_name,
+            "network": network["name"],
+            "chain_id": network["chain_id"],
+            "query": resolved["query"],
+            "query_kind": resolved["query_kind"],
+            "address": inspection["address"],
+            "classification": inspection["classification"],
+            "nonce": inspection["nonce"],
+            "code_present": inspection["code_present"],
+            "code_size_bytes": inspection["code_size_bytes"],
+            "detected_interfaces": inspection["detected_interfaces"],
+            "proxy_hints": inspection["proxy_hints"],
+            "token_standard": token_hints.get("token_standard", "unknown"),
+            "name": token_hints.get("name"),
+            "symbol": token_hints.get("symbol"),
+            "decimals": token_hints.get("decimals"),
+            "total_supply": token_hints.get("total_supply"),
+        }
+        if token_hints.get("metadata_uri") is not None:
+            payload["metadata_uri"] = token_hints["metadata_uri"]
+        return payload
+
     def balance_snapshot(
         self,
         account_name: str | None = None,
         network_name: str | None = None,
         token_address: str | None = None,
     ) -> dict[str, Any]:
-        effective_account_name = account_name
-        effective_network_name = network_name
-        if not effective_account_name:
-            effective_account_name = self._accounts().get_default_account_name()
-        if not effective_network_name:
-            effective_network_name = load_json(self.paths.networks_file, {"default_network": None}).get("default_network")
+        effective_account_name = account_name or self._accounts().get_default_account_name()
+        effective_network_name = network_name or load_json(self.paths.networks_file, {"default_network": None}).get(
+            "default_network"
+        )
         if not effective_account_name or not effective_network_name:
             return {
                 "summary": "Balance snapshot unavailable",
@@ -899,6 +879,7 @@ class VaultService:
         prepared["recipient_name"] = recipient_entry["name"]
         prepared["network_name"] = network["name"]
         prepared["requires_strong_confirmation"] = requires_strong_confirmation(self.profile_name, network)
+        prepared["action"] = "send"
         policy = self._policies().evaluate_action(
             account_name=account["name"],
             network_name=network["name"],
@@ -985,33 +966,156 @@ class VaultService:
                 max_fee_per_gas_gwei=max_fee_per_gas_gwei,
                 max_priority_fee_per_gas_gwei=max_priority_fee_per_gas_gwei,
             )
-        if preview.get("profile") != self.profile_name:
-            raise ValidationError("Prepared transaction does not belong to the active profile.")
-        account_name = preview["account_name"]
-        signer = resolve_signer(
-            self.paths,
-            {
-                "name": account_name,
-                "address": preview["from_address"],
-                "account_kind": preview.get("account_kind", "local"),
-                "signer_type": preview.get("signer_type", "local"),
-                "can_sign": preview.get("can_sign", True),
+        return self._execute_prepared_transaction(passphrase, preview)
+
+    def monitor_show_state(self, account_name: str | None = None, network_name: str | None = None) -> dict[str, Any]:
+        account = self._resolve_account_metadata(account_name)
+        network = self._networks().get_network(network_name)
+        state = self._monitor_state().get_state(account["name"], network["name"])
+        return {
+            "summary": f"Monitor state for {account['name']} on {network['name']}",
+            "profile": self.profile_name,
+            "account_name": account["name"],
+            "address": account["address"],
+            "network": network["name"],
+            "chain_id": network["chain_id"],
+            "state": state
+            or {
+                "account_name": account["name"],
+                "network_name": network["name"],
+                "address": account["address"],
+                "last_processed_block": None,
+                "last_known_nonce": None,
+                "last_native_balance": None,
+                "observed_tx_hashes": [],
+                "settled_tx_hashes": [],
+                "last_poll_at": None,
+                "updated_at": None,
             },
-        )
-        network = self._networks().get_network(preview["network_name"])
-        simulation = None
-        if preview.get("requires_simulation"):
-            simulation = EVMClient(network).simulate_transaction(preview["tx"])
-            if simulation["status"] != "success":
-                raise ValidationError("Protected transaction simulation failed. Broadcast cancelled.")
-        payload = signer.send_prepared(passphrase, preview, network)
-        payload["profile"] = self.profile_name
-        payload["account_name"] = account_name
-        payload["recipient_name"] = preview["recipient_name"]
-        payload["requires_strong_confirmation"] = preview["requires_strong_confirmation"]
-        payload["submitted_at"] = now_iso()
-        self._journal().record_submitted_transaction(payload, simulation=simulation)
-        return payload
+        }
+
+    def monitor_list_events(
+        self,
+        account_name: str | None = None,
+        network_name: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        account = self._resolve_account_metadata(account_name)
+        network = self._networks().get_network(network_name)
+        rows = self._journal().monitor_entries(account["name"], network["name"], limit=limit)
+        return {
+            "summary": f"Found {len(rows)} monitor event(s)",
+            "profile": self.profile_name,
+            "account_name": account["name"],
+            "address": account["address"],
+            "network": network["name"],
+            "events": rows,
+            "count": len(rows),
+        }
+
+    def monitor_poll(self, account_name: str | None = None, network_name: str | None = None) -> dict[str, Any]:
+        account = self._resolve_account_metadata(account_name)
+        network = self._networks().get_network(network_name)
+        client = EVMClient(network)
+        state = self._monitor_state().get_state(account["name"], network["name"]) or {
+            "account_name": account["name"],
+            "network_name": network["name"],
+            "address": account["address"],
+            "last_processed_block": None,
+            "last_known_nonce": None,
+            "last_native_balance": None,
+            "observed_tx_hashes": [],
+            "settled_tx_hashes": [],
+            "last_poll_at": None,
+            "updated_at": None,
+        }
+        latest_block = client.get_latest_block_number()
+        native_balance = client.get_native_balance(account["address"])
+        current_nonce = client.get_transaction_count(account["address"])
+        poll_time = now_iso()
+
+        new_events: list[dict[str, Any]] = []
+        new_events.extend(self._monitor_pending_receipts(account, network, client, state, poll_time))
+
+        if state["last_processed_block"] is None:
+            state["last_processed_block"] = latest_block
+        elif latest_block > int(state["last_processed_block"]):
+            new_events.extend(
+                self._monitor_new_blocks(
+                    account=account,
+                    network=network,
+                    client=client,
+                    state=state,
+                    start_block=int(state["last_processed_block"]) + 1,
+                    end_block=latest_block,
+                    created_at=poll_time,
+                )
+            )
+            state["last_processed_block"] = latest_block
+
+        previous_balance = state.get("last_native_balance")
+        if previous_balance is not None and previous_balance != native_balance["balance_wei"]:
+            delta = int(native_balance["balance_wei"]) - int(previous_balance)
+            new_events.append(
+                self._journal().record_event(
+                    build_monitor_event_id(account["name"], network["name"], "native-balance", poll_time),
+                    "monitor_balance_change",
+                    {
+                        "kind": "observation",
+                        "origin": "monitor",
+                        "event_type": "native_balance_changed",
+                        "status": "observed",
+                        "profile": self.profile_name,
+                        "network": network["name"],
+                        "chain_id": network["chain_id"],
+                        "account_name": account["name"],
+                        "address": account["address"],
+                        "asset_type": "native",
+                        "symbol": network["symbol"],
+                        "amount": format_units(abs(delta), 18),
+                        "amount_wei": str(abs(delta)),
+                        "created_at": poll_time,
+                        "details": {
+                            "direction": "increase" if delta >= 0 else "decrease",
+                            "previous_balance_wei": previous_balance,
+                            "current_balance_wei": native_balance["balance_wei"],
+                            "delta_wei": str(delta),
+                            "previous_balance": format_units(int(previous_balance), 18),
+                            "current_balance": native_balance["balance"],
+                            "delta": format_units(abs(delta), 18),
+                        },
+                    },
+                )
+            )
+
+        state["last_known_nonce"] = current_nonce
+        state["last_native_balance"] = native_balance["balance_wei"]
+        state["last_poll_at"] = poll_time
+        state["updated_at"] = poll_time
+        saved_state = self._monitor_state().save_state(account["name"], network["name"], state)
+        return {
+            "summary": f"Monitor poll for {account['name']} on {network['name']}",
+            "profile": self.profile_name,
+            "account_name": account["name"],
+            "address": account["address"],
+            "network": network["name"],
+            "chain_id": network["chain_id"],
+            "once": True,
+            "latest_block": latest_block,
+            "current_nonce": current_nonce,
+            "native_balance": native_balance,
+            "new_events": new_events,
+            "new_event_count": len(new_events),
+            "state": saved_state,
+        }
+
+    def monitor_watch(
+        self,
+        account_name: str | None = None,
+        network_name: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        while True:
+            yield self.monitor_poll(account_name=account_name, network_name=network_name)
 
     def safety_status(self) -> dict[str, Any]:
         prod_paths = resolve_paths(home=self.home_arg, profile="prod")
@@ -1038,12 +1142,17 @@ class VaultService:
             findings.append("Dev account `local-dev` exists only in prod.")
         if "local" in prod_network_names and "local" not in dev_network_names:
             findings.append("Dev network `local` exists only in prod.")
+        if path_is_within_git_worktree(self.paths.root_home):
+            findings.append(
+                f"Vault home `{self.paths.root_home}` is inside a git worktree. Move it outside the repo before publishing or committing."
+            )
         if not findings:
             findings.append("No immediate safety issues detected.")
 
         return {
             "summary": "Safety status",
             "active_profile": self.profile_name,
+            "storage_root": str(self.paths.root_home),
             "prod_default_account": prod_default_account,
             "prod_default_network": prod_default_network,
             "dev_default_account": dev_accounts.get("default_account"),
@@ -1115,11 +1224,11 @@ class VaultService:
     def _journal(self) -> JournalManager:
         return JournalManager(self.paths)
 
+    def _monitor_state(self) -> MonitorStateManager:
+        return MonitorStateManager(self.paths)
+
     def _policies(self) -> PolicyManager:
         return PolicyManager(self.paths)
-
-    def _smart_accounts(self) -> SmartAccountManager:
-        return SmartAccountManager(self.paths)
 
     def _profile_has_data(self, paths: Any) -> bool:
         return any(
@@ -1130,8 +1239,8 @@ class VaultService:
                 paths.networks_file,
                 paths.address_book_file,
                 paths.journal_file,
+                paths.monitor_state_file,
                 paths.policy_file,
-                paths.smart_accounts_file,
             )
         )
 
@@ -1142,51 +1251,320 @@ class VaultService:
             raise ValidationError("No account selected. Create/import an account or set a default account first.")
         return accounts.get_account_metadata(effective_name)
 
+    def _resolve_lookup_target(self, target: str | None, network_name: str | None) -> dict[str, Any]:
+        candidate = (target or "").strip()
+        if not candidate:
+            raise ValidationError("Lookup target cannot be empty.")
+        if candidate.startswith("0x"):
+            return {
+                "query": candidate,
+                "query_kind": "raw",
+                "address": normalize_address(candidate),
+            }
+
+        normalized_name: str
+        accounts = self._accounts()
+        try:
+            normalized_name = candidate.strip().lower()
+            if accounts.has_account(normalized_name):
+                metadata = accounts.get_account_metadata(normalized_name)
+                return {
+                    "query": candidate,
+                    "query_kind": "account",
+                    "address": metadata["address"],
+                }
+        except ValidationError:
+            pass
+
+        try:
+            entry = self._address_book().resolve(candidate, network_name)
+        except NotFoundError as exc:
+            raise NotFoundError(
+                f"Lookup target `{candidate}` was not found as a raw address, stored account, or address book label."
+            ) from exc
+        return {
+            "query": candidate,
+            "query_kind": "address_book",
+            "address": entry["address"],
+        }
+
     def _resolve_signer(self, account_name: str | None):
         metadata = self._resolve_account_metadata(account_name)
         return resolve_signer(self.paths, metadata)
 
-    def _require_safe_account(self, name: str | None) -> dict[str, Any]:
-        account = self._smart_accounts().get_account(name)
-        if account["type"] != "safe":
-            raise ValidationError(f"Smart account `{account['name']}` is not a Safe account.")
-        return account
+    def _load_abi(self, abi_file: str | None = None, abi_fragment: str | None = None) -> tuple[list[dict[str, Any]], str, str]:
+        if bool(abi_file) == bool(abi_fragment):
+            raise ValidationError("Provide exactly one of `--abi-file` or `--abi-fragment`.")
+        if abi_file:
+            try:
+                with open(abi_file, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except OSError as exc:
+                raise ValidationError(f"Could not read ABI file `{abi_file}`.") from exc
+            except json.JSONDecodeError as exc:
+                raise ValidationError(f"ABI file `{abi_file}` must contain valid JSON.") from exc
+            abi = payload.get("abi") if isinstance(payload, dict) and "abi" in payload else payload
+            if not isinstance(abi, list):
+                raise ValidationError("ABI files must contain a JSON ABI array or an object with an `abi` field.")
+            return abi, "file", abi_file
+        try:
+            fragment = json.loads(abi_fragment or "")
+        except json.JSONDecodeError as exc:
+            raise ValidationError("ABI fragment must be valid JSON.") from exc
+        if isinstance(fragment, dict):
+            abi = [fragment]
+        elif isinstance(fragment, list):
+            abi = fragment
+        else:
+            raise ValidationError("ABI fragment must be a JSON object or array.")
+        return abi, "fragment", "inline"
 
-    def _require_erc4337_account(self, name: str | None) -> dict[str, Any]:
-        account = self._smart_accounts().get_account(name)
-        if account["type"] != "erc4337":
-            raise ValidationError(f"Smart account `{account['name']}` is not an ERC-4337 account.")
-        return account
+    def _parse_args_json(self, args_json: str | None) -> list[Any]:
+        if not args_json:
+            return []
+        try:
+            payload = json.loads(args_json)
+        except json.JSONDecodeError as exc:
+            raise ValidationError("Arguments must be a valid JSON array.") from exc
+        if not isinstance(payload, list):
+            raise ValidationError("Arguments must be provided as a JSON array.")
+        return payload
 
-    def _ensure_safe_owner(self, safe_config: dict[str, Any], owner_name: str) -> None:
-        owner_metadata = self._resolve_account_metadata(owner_name)
-        owner_address = owner_metadata["address"].lower()
-        configured_owners = {str(owner).lower() for owner in safe_config["owners"]}
-        if owner_address not in configured_owners:
-            raise ValidationError(
-                f"Account `{owner_name}` ({owner_metadata['address']}) is not configured as a Safe owner for `{safe_config['name']}`."
-            )
-
-    def _enforce_smart_policy(
+    def _finalize_prepared_transaction(
         self,
-        account_name: str,
+        prepared: dict[str, Any],
+        account: dict[str, Any],
         network: dict[str, Any],
-        recipient: str,
-        amount: str,
-        token_address: str | None,
+        query: str,
+        query_kind: str,
+        recipient_name: str | None,
+        action: str,
+        details: dict[str, Any] | None,
+        policy_asset_type: str,
+        policy_amount: str,
+        policy_token_address: str | None,
     ) -> dict[str, Any]:
-        evaluation = self._policies().evaluate_action(
-            account_name=account_name,
+        prepared["profile"] = self.profile_name
+        prepared["account_name"] = account["name"]
+        prepared["account_kind"] = account.get("account_kind", "local")
+        prepared["signer_type"] = account.get("signer_type", "local")
+        prepared["can_sign"] = account.get("can_sign", True)
+        prepared["network_name"] = network["name"]
+        prepared["query"] = query
+        prepared["query_kind"] = query_kind
+        prepared["recipient_name"] = recipient_name
+        prepared["action"] = action
+        prepared["details"] = details
+        prepared["requires_strong_confirmation"] = requires_strong_confirmation(self.profile_name, network)
+        policy = self._policies().evaluate_action(
+            account_name=account["name"],
             network_name=network["name"],
-            recipient_address=recipient,
-            asset_type="erc20" if token_address else "native",
-            amount=amount,
-            token_address=token_address,
-            protected=requires_strong_confirmation(self.profile_name, network),
+            recipient_address=prepared["to_address"],
+            asset_type=policy_asset_type,
+            amount=policy_amount,
+            token_address=policy_token_address,
+            protected=prepared["requires_strong_confirmation"],
         )
-        if not evaluation["allowed"]:
-            raise ValidationError("; ".join(evaluation["findings"]))
-        return evaluation
+        if not policy["allowed"]:
+            raise ValidationError("; ".join(policy["findings"]))
+        prepared["policy_findings"] = policy["findings"]
+        prepared["requires_simulation"] = policy["requires_simulation"]
+        return prepared
+
+    def _simulate_prepared_transaction(self, preview: dict[str, Any], summary: str) -> dict[str, Any]:
+        network = self._networks().get_network(preview["network_name"])
+        simulation = EVMClient(network).simulate_transaction(preview["tx"])
+        simulation.update(
+            {
+                "summary": summary,
+                "profile": self.profile_name,
+                "account_name": preview["account_name"],
+                "network_name": preview["network_name"],
+                "to_address": preview["to_address"],
+                "recipient_name": preview.get("recipient_name"),
+                "asset_type": preview["asset_type"],
+                "token_address": preview.get("token_address"),
+                "contract_function": preview.get("contract_function"),
+                "args": preview.get("args"),
+                "value": preview.get("value"),
+                "amount": preview.get("amount"),
+                "requires_simulation": preview["requires_simulation"],
+            }
+        )
+        return simulation
+
+    def _execute_prepared_transaction(self, passphrase: str, preview: dict[str, Any]) -> dict[str, Any]:
+        if preview.get("profile") != self.profile_name:
+            raise ValidationError("Prepared transaction does not belong to the active profile.")
+        account_name = preview["account_name"]
+        signer = resolve_signer(
+            self.paths,
+            {
+                "name": account_name,
+                "address": preview["from_address"],
+                "account_kind": preview.get("account_kind", "local"),
+                "signer_type": preview.get("signer_type", "local"),
+                "can_sign": preview.get("can_sign", True),
+            },
+        )
+        network = self._networks().get_network(preview["network_name"])
+        simulation = None
+        if preview.get("requires_simulation"):
+            simulation = EVMClient(network).simulate_transaction(preview["tx"])
+            if simulation["status"] != "success":
+                raise ValidationError("Protected transaction simulation failed. Broadcast cancelled.")
+        payload = signer.send_prepared(passphrase, preview, network)
+        payload["profile"] = self.profile_name
+        payload["account_name"] = account_name
+        payload["recipient_name"] = preview.get("recipient_name")
+        payload["requires_strong_confirmation"] = preview["requires_strong_confirmation"]
+        payload["submitted_at"] = now_iso()
+        payload["action"] = preview.get("action", payload.get("action", "send"))
+        payload["details"] = preview.get("details")
+        self._journal().record_submitted_transaction(payload, simulation=simulation)
+        return payload
+
+    def _monitor_pending_receipts(
+        self,
+        account: dict[str, Any],
+        network: dict[str, Any],
+        client: EVMClient,
+        state: dict[str, Any],
+        created_at: str,
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        settled = set(state.get("settled_tx_hashes") or [])
+        for entry in self._journal().transaction_entries():
+            tx_hash = entry.get("tx_hash")
+            if not tx_hash:
+                continue
+            if entry.get("account_name") != account["name"] or entry.get("network") != network["name"]:
+                continue
+            if entry.get("receipt") or tx_hash in settled:
+                continue
+            receipt = client.get_transaction_receipt_or_none(tx_hash)
+            if not receipt:
+                continue
+            self._journal().attach_receipt(tx_hash, receipt)
+            events.append(
+                self._journal().record_event(
+                    build_monitor_event_id(account["name"], network["name"], f"receipt-{tx_hash[-8:]}", created_at),
+                    "monitor_receipt",
+                    {
+                        "kind": "observation",
+                        "origin": "monitor",
+                        "event_type": "transaction_confirmed" if receipt["status"] == 1 else "transaction_failed",
+                        "status": "confirmed" if receipt["status"] == 1 else "failed",
+                        "profile": self.profile_name,
+                        "network": network["name"],
+                        "chain_id": network["chain_id"],
+                        "account_name": account["name"],
+                        "address": account["address"],
+                        "tx_hash": tx_hash,
+                        "created_at": created_at,
+                        "details": {
+                            "source": "journal",
+                            "block_number": receipt.get("block_number"),
+                            "gas_used": receipt.get("gas_used"),
+                        },
+                    },
+                )
+            )
+            settled.add(tx_hash)
+        state["settled_tx_hashes"] = trim_hash_cache(settled)
+        return events
+
+    def _monitor_new_blocks(
+        self,
+        account: dict[str, Any],
+        network: dict[str, Any],
+        client: EVMClient,
+        state: dict[str, Any],
+        start_block: int,
+        end_block: int,
+        created_at: str,
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        observed = set(state.get("observed_tx_hashes") or [])
+        settled = set(state.get("settled_tx_hashes") or [])
+        for tx in client.get_relevant_transactions(account["address"], start_block, end_block):
+            tx_hash = tx["transaction_hash"]
+            direction = "outgoing" if tx["from_address"].lower() == account["address"].lower() else "incoming"
+            if tx_hash not in observed:
+                events.append(
+                    self._journal().record_event(
+                        build_monitor_event_id(account["name"], network["name"], f"{direction}-{tx_hash[-8:]}", created_at),
+                        "monitor_transaction_observed",
+                        {
+                            "kind": "observation",
+                            "origin": "monitor",
+                            "event_type": f"{direction}_transaction_observed",
+                            "status": "observed",
+                            "profile": self.profile_name,
+                            "network": network["name"],
+                            "chain_id": network["chain_id"],
+                            "account_name": account["name"],
+                            "address": account["address"],
+                            "from_address": tx["from_address"],
+                            "to_address": tx["to_address"],
+                            "asset_type": "native",
+                            "symbol": network["symbol"],
+                            "amount": format_units(int(tx["value_wei"]), 18),
+                            "amount_wei": tx["value_wei"],
+                            "nonce": tx["nonce"],
+                            "tx_hash": tx_hash,
+                            "created_at": created_at,
+                            "details": {
+                                "block_number": tx["block_number"],
+                                "direction": direction,
+                            },
+                        },
+                    )
+                )
+                observed.add(tx_hash)
+
+            receipt = client.get_transaction_receipt_or_none(tx_hash)
+            if receipt and tx_hash not in settled:
+                try:
+                    self._journal().attach_receipt(tx_hash, receipt)
+                except NotFoundError:
+                    pass
+                events.append(
+                    self._journal().record_event(
+                        build_monitor_event_id(account["name"], network["name"], f"confirmed-{tx_hash[-8:]}", created_at),
+                        "monitor_receipt",
+                        {
+                            "kind": "observation",
+                            "origin": "monitor",
+                            "event_type": "transaction_confirmed" if receipt["status"] == 1 else "transaction_failed",
+                            "status": "confirmed" if receipt["status"] == 1 else "failed",
+                            "profile": self.profile_name,
+                            "network": network["name"],
+                            "chain_id": network["chain_id"],
+                            "account_name": account["name"],
+                            "address": account["address"],
+                            "tx_hash": tx_hash,
+                            "created_at": created_at,
+                            "details": {
+                                "source": "block-scan",
+                                "block_number": receipt.get("block_number"),
+                                "gas_used": receipt.get("gas_used"),
+                            },
+                        },
+                    )
+                )
+                settled.add(tx_hash)
+        state["observed_tx_hashes"] = trim_hash_cache(observed)
+        state["settled_tx_hashes"] = trim_hash_cache(settled)
+        return events
+
+
+def build_monitor_event_id(account_name: str, network_name: str, label: str, created_at: str) -> str:
+    return f"monitor:{account_name}:{network_name}:{label}:{created_at}"
+
+
+def trim_hash_cache(values: set[str]) -> list[str]:
+    return sorted(values)[-MAX_MONITOR_CACHE:]
 
 
 def requires_strong_confirmation(profile_name: str, network: dict[str, Any]) -> bool:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from typing import Any
 
 from vault.config import ValidationError, VaultError
@@ -11,7 +12,18 @@ from vault.service import VaultService
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vault", description="Manage EVM wallet accounts from the terminal.")
+    def add_fee_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--nonce", type=int)
+        parser.add_argument("--gas-limit", type=int)
+        parser.add_argument("--gas-price")
+        parser.add_argument("--max-fee-per-gas")
+        parser.add_argument("--max-priority-fee-per-gas")
+
+    def add_abi_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--abi-file")
+        parser.add_argument("--abi-fragment")
+
+    parser = argparse.ArgumentParser(prog="vault", description="Operate a local-first EVM wallet from the terminal.")
     parser.add_argument("--home", help="Override the vault data directory.")
     parser.add_argument("--json", action="store_true", help="Emit JSON output.")
 
@@ -19,218 +31,85 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = subparsers.add_parser("profile", help="Manage isolated wallet profiles.")
     profile_subparsers = profile.add_subparsers(dest="profile_command", required=True)
-
-    profile_list = profile_subparsers.add_parser("list", help="List profiles.")
-    profile_list.set_defaults(handler="profile_list")
-
-    profile_show = profile_subparsers.add_parser("show", help="Show the active profile.")
-    profile_show.set_defaults(handler="profile_show")
-
+    profile_subparsers.add_parser("list", help="List profiles.")
+    profile_subparsers.add_parser("show", help="Show the active profile.")
     profile_use = profile_subparsers.add_parser("use", help="Switch the active profile.")
     profile_use.add_argument("--name", required=True, choices=["dev", "test", "prod"])
 
     account = subparsers.add_parser("account", help="Manage local accounts.")
     account_subparsers = account.add_subparsers(dest="account_command", required=True)
-
     account_create = account_subparsers.add_parser("create", help="Create a new account.")
     account_create.add_argument("--name", required=True)
     account_create.add_argument("--set-default", action="store_true")
-
     account_import = account_subparsers.add_parser("import", help="Import an existing private key.")
     account_import.add_argument("--name", required=True)
     account_import.add_argument("--private-key", help="Hex private key. If omitted, vault will prompt.")
     account_import.add_argument("--set-default", action="store_true")
-
     account_watch = account_subparsers.add_parser("watch", help="Add a watch-only account by address.")
     account_watch.add_argument("--name", required=True)
     account_watch.add_argument("--address", required=True)
     account_watch.add_argument("--set-default", action="store_true")
-
     account_subparsers.add_parser("list", help="List stored accounts.")
-
     account_use = account_subparsers.add_parser("use", help="Select the default account.")
     account_use.add_argument("--name", required=True)
 
     network = subparsers.add_parser("network", help="Manage network definitions.")
     network_subparsers = network.add_subparsers(dest="network_command", required=True)
-
     network_add = network_subparsers.add_parser("add", help="Add or update a custom network.")
     network_add.add_argument("--name", required=True)
     network_add.add_argument("--rpc-url", required=True)
     network_add.add_argument("--chain-id", required=True, type=int)
     network_add.add_argument("--symbol", required=True)
     network_add.add_argument("--set-default", action="store_true")
-
     network_add_alchemy = network_subparsers.add_parser("add-alchemy", help="Add an Alchemy-backed network preset.")
-    network_add_alchemy.add_argument("--preset", required=True, help="Alchemy preset like eth-sepolia or base-mainnet.")
-    network_add_alchemy.add_argument("--name", help="Local network name. Defaults to the preset name.")
-    network_add_alchemy.add_argument(
-        "--api-key-env",
-        default="ALCHEMY_API_KEY",
-        help="Environment variable containing the Alchemy API key.",
-    )
+    network_add_alchemy.add_argument("--preset", required=True)
+    network_add_alchemy.add_argument("--name")
+    network_add_alchemy.add_argument("--api-key-env", default="ALCHEMY_API_KEY")
     network_add_alchemy.add_argument("--set-default", action="store_true")
-
     network_add_anvil = network_subparsers.add_parser("add-anvil", help="Add a local Anvil network.")
-    network_add_anvil.add_argument("--name", default="local", help="Local network name. Defaults to `local`.")
+    network_add_anvil.add_argument("--name", default="local")
     network_add_anvil.add_argument("--rpc-url", default="http://127.0.0.1:8545")
     network_add_anvil.add_argument("--chain-id", default=31337, type=int)
     network_add_anvil.add_argument("--symbol", default="ETH")
     network_add_anvil.add_argument("--set-default", action="store_true")
-
     network_subparsers.add_parser("list", help="List stored networks.")
-
     network_subparsers.add_parser("list-presets", help="List built-in Alchemy presets.")
-
     network_use = network_subparsers.add_parser("use", help="Select the default network.")
     network_use.add_argument("--name", required=True)
 
     address_book = subparsers.add_parser("address-book", help="Manage labeled recipient addresses.")
     address_book_subparsers = address_book.add_subparsers(dest="address_book_command", required=True)
-
     address_book_subparsers.add_parser("list", help="List address book entries.")
-
     address_book_add = address_book_subparsers.add_parser("add", help="Add or update an address book entry.")
     address_book_add.add_argument("--name", required=True)
     address_book_add.add_argument("--address", required=True)
     address_book_add.add_argument("--network", help="Optional network scope for this entry.")
     address_book_add.add_argument("--notes", help="Optional notes.")
-
     address_book_remove = address_book_subparsers.add_parser("remove", help="Remove an address book entry.")
     address_book_remove.add_argument("--name", required=True)
 
-    smart_account = subparsers.add_parser("smart-account", help="Manage smart-account registry entries.")
-    smart_account_subparsers = smart_account.add_subparsers(dest="smart_account_command", required=True)
-    smart_account_subparsers.add_parser("list", help="List registered smart accounts.")
-    smart_account_show = smart_account_subparsers.add_parser("show", help="Show a smart account.")
-    smart_account_show.add_argument("--name")
-    smart_account_use = smart_account_subparsers.add_parser("use", help="Set the default smart account.")
-    smart_account_use.add_argument("--name", required=True)
-    smart_account_remove = smart_account_subparsers.add_parser("remove", help="Remove a registered smart account.")
-    smart_account_remove.add_argument("--name", required=True)
-
-    safe = subparsers.add_parser("safe", help="Manage Safe smart accounts.")
-    safe_subparsers = safe.add_subparsers(dest="safe_command", required=True)
-    safe_register = safe_subparsers.add_parser("register", help="Register an existing Safe.")
-    safe_register.add_argument("--name", required=True)
-    safe_register.add_argument("--address", required=True)
-    safe_register.add_argument("--network", required=True)
-    safe_register.add_argument("--service-url")
-    safe_register.add_argument("--entrypoint")
-    safe_register.add_argument("--set-default", action="store_true")
-    safe_sync = safe_subparsers.add_parser("sync", help="Refresh Safe owners and threshold from chain.")
-    safe_sync.add_argument("--name")
-    safe_create = safe_subparsers.add_parser("create", help="Submit a Safe proxy creation transaction.")
-    safe_create.add_argument("--signer-account", required=True)
-    safe_create.add_argument("--network", required=True)
-    safe_create.add_argument("--singleton", required=True)
-    safe_create.add_argument("--factory", required=True)
-    safe_create.add_argument("--fallback-handler", required=True)
-    safe_create.add_argument("--owners", required=True, help="Comma-separated owner account names or addresses.")
-    safe_create.add_argument("--threshold", required=True, type=int)
-    safe_create.add_argument("--salt-nonce", required=True, type=int)
-    safe_pending = safe_subparsers.add_parser("pending", help="List pending Safe transactions.")
-    safe_pending.add_argument("--name")
-    safe_tx = safe_subparsers.add_parser("tx", help="Show a pending Safe transaction.")
-    safe_tx.add_argument("--safe-tx-hash", required=True)
-    safe_tx.add_argument("--name")
-    safe_propose = safe_subparsers.add_parser("propose", help="Propose a Safe transaction.")
-    safe_propose.add_argument("--name")
-    safe_propose.add_argument("--signer-account", required=True)
-    safe_propose.add_argument("--to", required=True)
-    safe_propose.add_argument("--value", default="0")
-    safe_propose.add_argument("--data", default="0x")
-    safe_propose.add_argument("--operation", default=0, type=int)
-    safe_propose.add_argument("--nonce", type=int)
-    safe_propose.add_argument("--origin")
-    safe_owner_add = safe_subparsers.add_parser("owner-add", help="Propose adding a Safe owner.")
-    safe_owner_add.add_argument("--name")
-    safe_owner_add.add_argument("--signer-account", required=True)
-    safe_owner_add.add_argument("--owner-address", required=True)
-    safe_owner_add.add_argument("--threshold", type=int)
-    safe_owner_add.add_argument("--nonce", type=int)
-    safe_owner_remove = safe_subparsers.add_parser("owner-remove", help="Propose removing a Safe owner.")
-    safe_owner_remove.add_argument("--name")
-    safe_owner_remove.add_argument("--signer-account", required=True)
-    safe_owner_remove.add_argument("--prev-owner", required=True)
-    safe_owner_remove.add_argument("--owner-address", required=True)
-    safe_owner_remove.add_argument("--threshold", required=True, type=int)
-    safe_owner_remove.add_argument("--nonce", type=int)
-    safe_threshold = safe_subparsers.add_parser("threshold-set", help="Propose changing Safe threshold.")
-    safe_threshold.add_argument("--name")
-    safe_threshold.add_argument("--signer-account", required=True)
-    safe_threshold.add_argument("--threshold", required=True, type=int)
-    safe_threshold.add_argument("--nonce", type=int)
-    safe_confirm = safe_subparsers.add_parser("confirm", help="Confirm a pending Safe transaction.")
-    safe_confirm.add_argument("--name")
-    safe_confirm.add_argument("--signer-account", required=True)
-    safe_confirm.add_argument("--safe-tx-hash", required=True)
-    safe_execute = safe_subparsers.add_parser("execute", help="Execute a confirmed Safe transaction.")
-    safe_execute.add_argument("--name")
-    safe_execute.add_argument("--signer-account", required=True)
-    safe_execute.add_argument("--safe-tx-hash", required=True)
-
-    aa = subparsers.add_parser("aa", help="Manage ERC-4337 smart accounts.")
-    aa_subparsers = aa.add_subparsers(dest="aa_command", required=True)
-    aa_register = aa_subparsers.add_parser("register", help="Register an ERC-4337 smart account.")
-    aa_register.add_argument("--name", required=True)
-    aa_register.add_argument("--sender", required=True)
-    aa_register.add_argument("--network", required=True)
-    aa_register.add_argument("--owner-account", required=True)
-    aa_register.add_argument("--entrypoint", required=True)
-    aa_register.add_argument("--version", default="0.6")
-    aa_register.add_argument("--factory")
-    aa_register.add_argument("--factory-data")
-    aa_register.add_argument("--bundler-url")
-    aa_register.add_argument("--paymaster-url")
-    aa_register.add_argument("--set-default", action="store_true")
-    aa_prepare = aa_subparsers.add_parser("prepare", help="Prepare a user operation.")
-    aa_prepare.add_argument("--name")
-    aa_prepare.add_argument("--to", required=True)
-    aa_prepare.add_argument("--value", default="0")
-    aa_prepare.add_argument("--data", default="0x")
-    aa_prepare.add_argument("--nonce")
-    aa_prepare.add_argument("--signature")
-    aa_sign = aa_subparsers.add_parser("sign", help="Sign a prepared user operation from a JSON file.")
-    aa_sign.add_argument("--name")
-    aa_sign.add_argument("--file", required=True)
-    aa_simulate = aa_subparsers.add_parser("simulate", help="Simulate a prepared user operation from a JSON file.")
-    aa_simulate.add_argument("--name")
-    aa_simulate.add_argument("--file", required=True)
-    aa_submit = aa_subparsers.add_parser("submit", help="Submit a signed user operation from a JSON file.")
-    aa_submit.add_argument("--name")
-    aa_submit.add_argument("--file", required=True)
-    aa_status = aa_subparsers.add_parser("status", help="Fetch status for a submitted user operation.")
-    aa_status.add_argument("--name")
-    aa_status.add_argument("--user-operation-hash", required=True)
-
     backup = subparsers.add_parser("backup", help="Backup verification helpers.")
     backup_subparsers = backup.add_subparsers(dest="backup_command", required=True)
-
     backup_verify = backup_subparsers.add_parser("verify", help="Verify a stored encrypted keystore can be unlocked.")
     backup_verify.add_argument("--account", required=True)
 
     theme = subparsers.add_parser("theme", help="Manage TUI themes.")
     theme_subparsers = theme.add_subparsers(dest="theme_command", required=True)
-
     theme_subparsers.add_parser("list", help="List built-in TUI themes.")
     theme_subparsers.add_parser("show", help="Show the active TUI theme.")
-
     theme_use = theme_subparsers.add_parser("use", help="Set the active TUI theme for this profile.")
     theme_use.add_argument("--name", required=True)
 
     safety = subparsers.add_parser("safety", help="Safety helpers for profile separation.")
     safety_subparsers = safety.add_subparsers(dest="safety_command", required=True)
-
     safety_subparsers.add_parser("status", help="Inspect risky defaults and mixed dev/prod state.")
-
     safety_separate = safety_subparsers.add_parser("separate-dev", help="Move dev defaults out of prod.")
-    safety_separate.add_argument("--prod-account", required=True, help="The intended default account for prod.")
-    safety_separate.add_argument("--prod-network", required=True, help="The intended default network for prod.")
-    safety_separate.add_argument("--dev-account", required=True, help="An existing account in prod to copy into dev.")
-    safety_separate.add_argument("--dev-network", required=True, help="An existing network in prod to copy into dev.")
-    safety_separate.add_argument("--overwrite", action="store_true", help="Overwrite existing dev entries if present.")
-    safety_separate.add_argument("--dry-run", action="store_true", help="Show the planned actions without changing data.")
+    safety_separate.add_argument("--prod-account", required=True)
+    safety_separate.add_argument("--prod-network", required=True)
+    safety_separate.add_argument("--dev-account", required=True)
+    safety_separate.add_argument("--dev-network", required=True)
+    safety_separate.add_argument("--overwrite", action="store_true")
+    safety_separate.add_argument("--dry-run", action="store_true")
 
     doctor = subparsers.add_parser("doctor", help="Verify the selected RPC configuration.")
     doctor.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
@@ -241,72 +120,138 @@ def build_parser() -> argparse.ArgumentParser:
 
     sign_typed_data = subparsers.add_parser("sign-typed-data", help="Sign EIP-712 typed data from a JSON file.")
     sign_typed_data.add_argument("--account", help="Stored signer account. Defaults to the configured default account.")
-    sign_typed_data.add_argument("--file", required=True, help="Path to JSON payload containing the full typed data object.")
+    sign_typed_data.add_argument("--file", required=True)
 
     balance = subparsers.add_parser("balance", help="Fetch a balance.")
     balance.add_argument("--account", help="Stored account name. Defaults to the configured default account.")
     balance.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
     balance.add_argument("--token", help="ERC-20 token address. Omit for the native asset.")
 
+    lookup = subparsers.add_parser("lookup", help="Inspect an address, token contract, or generic contract.")
+    lookup_subparsers = lookup.add_subparsers(dest="lookup_command", required=True)
+    lookup_address = lookup_subparsers.add_parser("address", help="Inspect an address as an EOA or contract.")
+    lookup_address.add_argument("--target", required=True, help="Raw address, stored account name, or address-book label.")
+    lookup_address.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+    lookup_token = lookup_subparsers.add_parser("token", help="Inspect a token-like contract.")
+    lookup_token.add_argument("--target", required=True, help="Raw address, stored account name, or address-book label.")
+    lookup_token.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+    lookup_token.add_argument("--holder", help="Optional holder address, stored account name, or address-book label.")
+    lookup_contract = lookup_subparsers.add_parser("contract", help="Inspect a generic contract with interface and proxy hints.")
+    lookup_contract.add_argument("--target", required=True, help="Raw address, stored account name, or address-book label.")
+    lookup_contract.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+
+    contract = subparsers.add_parser("contract", help="Read from and write to contracts with explicit ABI input.")
+    contract_subparsers = contract.add_subparsers(dest="contract_command", required=True)
+    contract_read = contract_subparsers.add_parser("read", help="Execute a contract read call.")
+    contract_read.add_argument("--target", required=True)
+    contract_read.add_argument("--function", required=True)
+    add_abi_arguments(contract_read)
+    contract_read.add_argument("--args", help="JSON array of function arguments.")
+    contract_read.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+
+    contract_write = contract_subparsers.add_parser("write", help="Preview, simulate, or execute a contract write.")
+    contract_write_subparsers = contract_write.add_subparsers(dest="contract_write_command", required=True)
+    for name in ("preview", "simulate", "execute"):
+        contract_write_action = contract_write_subparsers.add_parser(name, help=f"{name.title()} a contract write.")
+        contract_write_action.add_argument("--target", required=True)
+        contract_write_action.add_argument("--from-account", required=True)
+        contract_write_action.add_argument("--function", required=True)
+        add_abi_arguments(contract_write_action)
+        contract_write_action.add_argument("--args", help="JSON array of function arguments.")
+        contract_write_action.add_argument("--value", help="Optional native asset value to send with the call.")
+        contract_write_action.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+        add_fee_arguments(contract_write_action)
+        if name == "execute":
+            contract_write_action.add_argument("--yes", action="store_true")
+
+    token = subparsers.add_parser("token", help="Token-specific helpers built on contract primitives.")
+    token_subparsers = token.add_subparsers(dest="token_command", required=True)
+    token_allowance = token_subparsers.add_parser("allowance", help="Read ERC-20 allowance.")
+    token_allowance.add_argument("--token", required=True)
+    token_allowance.add_argument("--owner", required=True)
+    token_allowance.add_argument("--spender", required=True)
+    token_allowance.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+
+    token_approve = token_subparsers.add_parser("approve", help="Preview, simulate, or execute ERC-20 approvals.")
+    token_approve_subparsers = token_approve.add_subparsers(dest="token_approve_command", required=True)
+    for name in ("preview", "simulate", "execute"):
+        token_approve_action = token_approve_subparsers.add_parser(name, help=f"{name.title()} an ERC-20 approval.")
+        token_approve_action.add_argument("--token", required=True)
+        token_approve_action.add_argument("--from-account", required=True)
+        token_approve_action.add_argument("--spender", required=True)
+        token_approve_action.add_argument("--amount", required=True)
+        token_approve_action.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+        add_fee_arguments(token_approve_action)
+        if name == "execute":
+            token_approve_action.add_argument("--yes", action="store_true")
+
     simulate = subparsers.add_parser("simulate", help="Simulate a transaction before broadcast.")
     simulate.add_argument("--from-account", help="Stored sender account. Defaults to the configured default account.")
     simulate.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
-    simulate.add_argument("--to", required=True, help="Recipient address or address-book label.")
-    simulate.add_argument("--amount", required=True, help="Human-readable decimal amount.")
-    simulate.add_argument("--token", help="ERC-20 token address. Omit for the native asset.")
-    simulate.add_argument("--nonce", type=int)
-    simulate.add_argument("--gas-limit", type=int)
-    simulate.add_argument("--gas-price", help="Legacy gas price in gwei.")
-    simulate.add_argument("--max-fee-per-gas", help="EIP-1559 max fee per gas in gwei.")
-    simulate.add_argument("--max-priority-fee-per-gas", help="EIP-1559 max priority fee per gas in gwei.")
+    simulate.add_argument("--to", required=True)
+    simulate.add_argument("--amount", required=True)
+    simulate.add_argument("--token")
+    add_fee_arguments(simulate)
 
     send = subparsers.add_parser("send", help="Sign and broadcast a transaction.")
     send.add_argument("--from-account", help="Stored sender account. Defaults to the configured default account.")
     send.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
-    send.add_argument("--to", required=True, help="Recipient address or address-book label.")
-    send.add_argument("--amount", required=True, help="Human-readable decimal amount.")
-    send.add_argument("--token", help="ERC-20 token address. Omit for the native asset.")
-    send.add_argument("--nonce", type=int)
-    send.add_argument("--gas-limit", type=int)
-    send.add_argument("--gas-price", help="Legacy gas price in gwei.")
-    send.add_argument("--max-fee-per-gas", help="EIP-1559 max fee per gas in gwei.")
-    send.add_argument("--max-priority-fee-per-gas", help="EIP-1559 max priority fee per gas in gwei.")
-    send.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+    send.add_argument("--to", required=True)
+    send.add_argument("--amount", required=True)
+    send.add_argument("--token")
+    add_fee_arguments(send)
+    send.add_argument("--yes", action="store_true")
+
+    monitor = subparsers.add_parser("monitor", help="Observe wallet activity and balance changes.")
+    monitor_subparsers = monitor.add_subparsers(dest="monitor_command", required=True)
+    monitor_run = monitor_subparsers.add_parser("run", help="Poll account activity.")
+    monitor_run.add_argument("--account", help="Stored account name. Defaults to the configured default account.")
+    monitor_run.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+    monitor_run.add_argument("--interval", type=int, default=10, help="Polling interval in seconds.")
+    monitor_run.add_argument("--once", action="store_true", help="Perform a single poll and exit.")
+    monitor_list = monitor_subparsers.add_parser("list-events", help="List monitor-written journal events.")
+    monitor_list.add_argument("--account", help="Stored account name. Defaults to the configured default account.")
+    monitor_list.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
+    monitor_list.add_argument("--limit", type=int, default=20)
+    monitor_show = monitor_subparsers.add_parser("show-state", help="Show stored monitor state.")
+    monitor_show.add_argument("--account", help="Stored account name. Defaults to the configured default account.")
+    monitor_show.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
 
     journal = subparsers.add_parser("journal", help="Inspect the local execution journal.")
     journal_subparsers = journal.add_subparsers(dest="journal_command", required=True)
     journal_subparsers.add_parser("list", help="List local journal entries.")
-    journal_show = journal_subparsers.add_parser("show", help="Show a journal entry by transaction hash.")
-    journal_show.add_argument("--tx-hash", required=True)
+    journal_show = journal_subparsers.add_parser("show", help="Show a journal entry by id.")
+    journal_show.add_argument("--id", dest="entry_id")
+    journal_show.add_argument("--tx-hash", dest="entry_id")
 
     receipt = subparsers.add_parser("receipt", help="Fetch and store a transaction receipt.")
     receipt_subparsers = receipt.add_subparsers(dest="receipt_command", required=True)
     receipt_show = receipt_subparsers.add_parser("show", help="Show a transaction receipt.")
     receipt_show.add_argument("--tx-hash", required=True)
-    receipt_show.add_argument("--network", help="Network name. Optional if the tx is already in the local journal.")
+    receipt_show.add_argument("--network")
 
     policy = subparsers.add_parser("policy", help="Manage outbound policy rules.")
     policy_subparsers = policy.add_subparsers(dest="policy_command", required=True)
     policy_subparsers.add_parser("list", help="List stored policy rules.")
     policy_show = policy_subparsers.add_parser("show", help="Show effective policy.")
-    policy_show.add_argument("--account", help="Optional account override scope.")
+    policy_show.add_argument("--account")
     policy_set = policy_subparsers.add_parser("set", help="Set a policy rule.")
     policy_set.add_argument("--rule", required=True)
     policy_set.add_argument("--value", required=True)
-    policy_set.add_argument("--account", help="Optional account override scope.")
+    policy_set.add_argument("--account")
     policy_unset = policy_subparsers.add_parser("unset", help="Unset a policy rule.")
     policy_unset.add_argument("--rule", required=True)
-    policy_unset.add_argument("--account", help="Optional account override scope.")
+    policy_unset.add_argument("--account")
     policy_explain = policy_subparsers.add_parser("explain", help="Explain whether an action is allowed.")
-    policy_explain.add_argument("--account", help="Stored sender account. Defaults to the configured default account.")
-    policy_explain.add_argument("--network", help="Stored network name. Defaults to the configured default network.")
-    policy_explain.add_argument("--to", required=True, help="Recipient address or address-book label.")
-    policy_explain.add_argument("--amount", required=True, help="Human-readable decimal amount.")
-    policy_explain.add_argument("--token", help="ERC-20 token address. Omit for the native asset.")
+    policy_explain.add_argument("--account")
+    policy_explain.add_argument("--network")
+    policy_explain.add_argument("--to", required=True)
+    policy_explain.add_argument("--amount", required=True)
+    policy_explain.add_argument("--token")
 
     ui = subparsers.add_parser("ui", help="Launch the interactive terminal UI.")
-    ui.add_argument("--profile", choices=["dev", "test", "prod"], help="Open the UI against a specific profile.")
-    ui.add_argument("--allow-prod", action="store_true", help="Allow opening the UI directly on the prod profile.")
+    ui.add_argument("--profile", choices=["dev", "test", "prod"])
+    ui.add_argument("--allow-prod", action="store_true")
 
     return parser
 
@@ -316,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         payload = dispatch(args)
-        emit(payload, args.json)
+        if payload is not None:
+            emit(payload, args.json)
         return 0
     except VaultError as exc:
         emit({"summary": "Command failed", "error": str(exc)}, args.json)
@@ -326,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-def dispatch(args: argparse.Namespace) -> dict[str, Any]:
+def dispatch(args: argparse.Namespace) -> dict[str, Any] | None:
     service = VaultService(home=args.home)
 
     if args.command == "profile":
@@ -397,152 +343,6 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if args.address_book_command == "remove":
             return service.remove_address_book_entry(args.name)
 
-    if args.command == "smart-account":
-        if args.smart_account_command == "list":
-            return service.list_smart_accounts()
-        if args.smart_account_command == "show":
-            return service.show_smart_account(args.name)
-        if args.smart_account_command == "use":
-            return service.use_smart_account(args.name)
-        if args.smart_account_command == "remove":
-            return service.remove_smart_account(args.name)
-
-    if args.command == "safe":
-        if args.safe_command == "register":
-            return service.register_safe_account(
-                name=args.name,
-                address=args.address,
-                network_name=args.network,
-                service_url=args.service_url,
-                entrypoint=args.entrypoint,
-                set_default=args.set_default,
-            )
-        if args.safe_command == "sync":
-            return service.sync_safe_account(args.name)
-        if args.safe_command == "create":
-            passphrase = service._accounts().prompt_passphrase()
-            owners = [item.strip() for item in args.owners.split(",") if item.strip()]
-            resolved_owners = []
-            for owner in owners:
-                if owner.startswith("0x"):
-                    resolved_owners.append(owner)
-                else:
-                    resolved_owners.append(service._resolve_account_metadata(owner)["address"])
-            return service.create_safe_account(
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                network_name=args.network,
-                singleton=args.singleton,
-                factory=args.factory,
-                fallback_handler=args.fallback_handler,
-                owners=resolved_owners,
-                threshold=args.threshold,
-                salt_nonce=args.salt_nonce,
-            )
-        if args.safe_command == "pending":
-            return service.list_safe_pending_transactions(args.name)
-        if args.safe_command == "tx":
-            return service.show_safe_pending_transaction(args.safe_tx_hash, args.name)
-        if args.safe_command == "propose":
-            passphrase = service._accounts().prompt_passphrase()
-            return service.propose_safe_transaction(
-                name=args.name,
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                to=args.to,
-                value=args.value,
-                data=args.data,
-                operation=args.operation,
-                nonce=args.nonce,
-                origin=args.origin,
-            )
-        if args.safe_command == "owner-add":
-            passphrase = service._accounts().prompt_passphrase()
-            return service.propose_safe_add_owner(
-                name=args.name,
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                owner_address=args.owner_address,
-                threshold=args.threshold,
-                nonce=args.nonce,
-            )
-        if args.safe_command == "owner-remove":
-            passphrase = service._accounts().prompt_passphrase()
-            return service.propose_safe_remove_owner(
-                name=args.name,
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                prev_owner=args.prev_owner,
-                owner_address=args.owner_address,
-                threshold=args.threshold,
-                nonce=args.nonce,
-            )
-        if args.safe_command == "threshold-set":
-            passphrase = service._accounts().prompt_passphrase()
-            return service.propose_safe_change_threshold(
-                name=args.name,
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                threshold=args.threshold,
-                nonce=args.nonce,
-            )
-        if args.safe_command == "confirm":
-            passphrase = service._accounts().prompt_passphrase()
-            return service.confirm_safe_transaction(
-                name=args.name,
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                safe_tx_hash=args.safe_tx_hash,
-            )
-        if args.safe_command == "execute":
-            passphrase = service._accounts().prompt_passphrase()
-            return service.execute_safe_transaction(
-                name=args.name,
-                signer_account=args.signer_account,
-                passphrase=passphrase,
-                safe_tx_hash=args.safe_tx_hash,
-            )
-
-    if args.command == "aa":
-        if args.aa_command == "register":
-            return service.register_erc4337_account(
-                name=args.name,
-                sender=args.sender,
-                network_name=args.network,
-                owner_account=args.owner_account,
-                entrypoint=args.entrypoint,
-                version=args.version,
-                factory=args.factory,
-                factory_data=args.factory_data,
-                bundler_url=args.bundler_url,
-                paymaster_url=args.paymaster_url,
-                set_default=args.set_default,
-            )
-        if args.aa_command == "prepare":
-            return service.prepare_user_operation(
-                name=args.name,
-                to=args.to,
-                value=args.value,
-                data=args.data,
-                nonce=args.nonce,
-                signature=args.signature,
-            )
-        if args.aa_command == "sign":
-            passphrase = service._accounts().prompt_passphrase()
-            with open(args.file, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            return service.sign_user_operation(args.name, passphrase, payload)
-        if args.aa_command == "simulate":
-            with open(args.file, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            return service.simulate_user_operation(args.name, payload)
-        if args.aa_command == "submit":
-            with open(args.file, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            return service.submit_user_operation(args.name, payload)
-        if args.aa_command == "status":
-            return service.user_operation_status(args.name, args.user_operation_hash)
-
     if args.command == "theme":
         if args.theme_command == "list":
             return service.list_themes()
@@ -583,11 +383,132 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return service.sign_typed_data(args.account, passphrase, payload)
 
     if args.command == "balance":
-        return service.balance(
-            account_name=args.account,
-            network_name=args.network,
-            token_address=args.token,
-        )
+        return service.balance(account_name=args.account, network_name=args.network, token_address=args.token)
+
+    if args.command == "lookup":
+        if args.lookup_command == "address":
+            return service.lookup_address(target=args.target, network_name=args.network)
+        if args.lookup_command == "token":
+            return service.lookup_token(target=args.target, network_name=args.network, holder=args.holder)
+        if args.lookup_command == "contract":
+            return service.lookup_contract(target=args.target, network_name=args.network)
+
+    if args.command == "contract":
+        if args.contract_command == "read":
+            return service.contract_read(
+                target=args.target,
+                function_name=args.function,
+                abi_file=args.abi_file,
+                abi_fragment=args.abi_fragment,
+                args_json=args.args,
+                network_name=args.network,
+            )
+        if args.contract_command == "write":
+            if args.contract_write_command == "preview":
+                return service.preview_contract_write(
+                    from_account_name=args.from_account,
+                    target=args.target,
+                    function_name=args.function,
+                    abi_file=args.abi_file,
+                    abi_fragment=args.abi_fragment,
+                    args_json=args.args,
+                    value=args.value,
+                    network_name=args.network,
+                    nonce=args.nonce,
+                    gas_limit=args.gas_limit,
+                    gas_price_gwei=args.gas_price,
+                    max_fee_per_gas_gwei=args.max_fee_per_gas,
+                    max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
+                )
+            if args.contract_write_command == "simulate":
+                return service.simulate_contract_write(
+                    from_account_name=args.from_account,
+                    target=args.target,
+                    function_name=args.function,
+                    abi_file=args.abi_file,
+                    abi_fragment=args.abi_fragment,
+                    args_json=args.args,
+                    value=args.value,
+                    network_name=args.network,
+                    nonce=args.nonce,
+                    gas_limit=args.gas_limit,
+                    gas_price_gwei=args.gas_price,
+                    max_fee_per_gas_gwei=args.max_fee_per_gas,
+                    max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
+                )
+            if args.contract_write_command == "execute":
+                preview = service.preview_contract_write(
+                    from_account_name=args.from_account,
+                    target=args.target,
+                    function_name=args.function,
+                    abi_file=args.abi_file,
+                    abi_fragment=args.abi_fragment,
+                    args_json=args.args,
+                    value=args.value,
+                    network_name=args.network,
+                    nonce=args.nonce,
+                    gas_limit=args.gas_limit,
+                    gas_price_gwei=args.gas_price,
+                    max_fee_per_gas_gwei=args.max_fee_per_gas,
+                    max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
+                )
+                if not args.yes:
+                    confirm_transaction(preview)
+                passphrase = service._accounts().prompt_passphrase()
+                return service.execute_contract_write(passphrase=passphrase, preview=preview)
+
+    if args.command == "token":
+        if args.token_command == "allowance":
+            return service.token_allowance(
+                token_target=args.token,
+                owner=args.owner,
+                spender=args.spender,
+                network_name=args.network,
+            )
+        if args.token_command == "approve":
+            if args.token_approve_command == "preview":
+                return service.preview_token_approve(
+                    from_account_name=args.from_account,
+                    token_target=args.token,
+                    spender=args.spender,
+                    amount=args.amount,
+                    network_name=args.network,
+                    nonce=args.nonce,
+                    gas_limit=args.gas_limit,
+                    gas_price_gwei=args.gas_price,
+                    max_fee_per_gas_gwei=args.max_fee_per_gas,
+                    max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
+                )
+            if args.token_approve_command == "simulate":
+                return service.simulate_token_approve(
+                    from_account_name=args.from_account,
+                    token_target=args.token,
+                    spender=args.spender,
+                    amount=args.amount,
+                    network_name=args.network,
+                    nonce=args.nonce,
+                    gas_limit=args.gas_limit,
+                    gas_price_gwei=args.gas_price,
+                    max_fee_per_gas_gwei=args.max_fee_per_gas,
+                    max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
+                )
+            if args.token_approve_command == "execute":
+                preview = service.preview_token_approve(
+                    from_account_name=args.from_account,
+                    token_target=args.token,
+                    spender=args.spender,
+                    amount=args.amount,
+                    network_name=args.network,
+                    nonce=args.nonce,
+                    gas_limit=args.gas_limit,
+                    gas_price_gwei=args.gas_price,
+                    max_fee_per_gas_gwei=args.max_fee_per_gas,
+                    max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
+                )
+                if not args.yes:
+                    confirm_transaction(preview)
+                passphrase = service._accounts().prompt_passphrase()
+                return service.execute_token_approve(passphrase=passphrase, preview=preview)
 
     if args.command == "simulate":
         return service.simulate_send(
@@ -617,7 +538,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
         )
         if not args.yes:
-            confirm_send(preview)
+            confirm_transaction(preview)
         passphrase = service._accounts().prompt_passphrase()
         return service.execute_send(
             passphrase=passphrase,
@@ -633,11 +554,23 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             max_priority_fee_per_gas_gwei=args.max_priority_fee_per_gas,
         )
 
+    if args.command == "monitor":
+        if args.monitor_command == "show-state":
+            return service.monitor_show_state(args.account, args.network)
+        if args.monitor_command == "list-events":
+            return service.monitor_list_events(args.account, args.network, args.limit)
+        if args.monitor_command == "run":
+            if args.once:
+                return service.monitor_poll(args.account, args.network)
+            return run_monitor_loop(service, args.account, args.network, max(1, args.interval), args.json)
+
     if args.command == "journal":
         if args.journal_command == "list":
             return service.list_journal()
         if args.journal_command == "show":
-            return service.show_journal_entry(args.tx_hash)
+            if not args.entry_id:
+                raise ValidationError("Provide `--id` for the journal entry.")
+            return service.show_journal_entry(args.entry_id)
 
     if args.command == "receipt":
         if args.receipt_command == "show":
@@ -667,8 +600,32 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     raise ValidationError(f"Unhandled command: {args.command}")
 
 
-def confirm_send(preview: dict[str, Any]) -> None:
-    asset = preview["token_address"] if preview["asset_type"] == "erc20" else preview["symbol"]
+def run_monitor_loop(
+    service: VaultService,
+    account_name: str | None,
+    network_name: str | None,
+    interval: int,
+    as_json: bool,
+) -> dict[str, Any]:
+    while True:
+        payload = service.monitor_poll(account_name=account_name, network_name=network_name)
+        emit(payload, as_json)
+        time.sleep(interval)
+
+
+def confirm_transaction(preview: dict[str, Any]) -> None:
+    if preview["asset_type"] == "erc20":
+        asset = preview["token_address"]
+        quantity = preview["amount"]
+    elif preview["asset_type"] == "erc20_approval":
+        asset = preview["token_address"]
+        quantity = preview["amount"]
+    elif preview["asset_type"] == "contract":
+        asset = preview.get("contract_function") or "contract_write"
+        quantity = preview.get("value") or "0"
+    else:
+        asset = preview["symbol"]
+        quantity = preview["amount"]
     print(f"Profile: {preview['profile']}")
     print(f"Network: {preview['network_name']}")
     print(f"From:    {preview['from_address']}")
@@ -677,13 +634,17 @@ def confirm_send(preview: dict[str, Any]) -> None:
     else:
         print(f"To:      {preview['to_address']}")
     print(f"Asset:   {asset}")
-    print(f"Amount:  {preview['amount']}")
+    if preview["asset_type"] == "contract":
+        print(f"Function: {preview.get('contract_function')}")
+        print(f"Value:    {quantity}")
+    else:
+        print(f"Amount:  {quantity}")
     print(f"Nonce:   {preview['nonce']}")
     print(f"Gas:     {preview['gas_limit']}")
     print(f"Fee:     {preview['fee_model']} max={preview['max_fee_cost_wei']} wei")
     if preview["requires_strong_confirmation"]:
         suffix = preview["to_address"][-6:]
-        amount = preview["amount"]
+        amount = quantity
         answer = input(f"Type {suffix} to confirm this protected transaction: ").strip()
         if answer != suffix:
             raise ValidationError("Protected transaction cancelled.")

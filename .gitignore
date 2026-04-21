@@ -37,8 +37,18 @@ wallet-backup/
 .env
 .env.*
 !.env.example
+.envrc
 *.local
 secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.bak
+*.backup
 
 # Local project files
 AGENTS.md

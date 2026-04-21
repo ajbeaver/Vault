@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 
 DEFAULT_HOME_NAME = ".vault"
 DEFAULT_PROFILES = ("dev", "test", "prod")
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
 
 
 class VaultError(Exception):
@@ -39,8 +42,8 @@ class VaultPaths:
     networks_file: Path
     address_book_file: Path
     journal_file: Path
+    monitor_state_file: Path
     policy_file: Path
-    smart_accounts_file: Path
     using_legacy_profile_home: bool
 
 
@@ -68,17 +71,18 @@ def resolve_paths(home: str | None = None, profile: str | None = None) -> VaultP
         networks_file=profile_home / "networks.json",
         address_book_file=profile_home / "address_book.json",
         journal_file=profile_home / "journal.json",
+        monitor_state_file=profile_home / "monitor_state.json",
         policy_file=profile_home / "policy.json",
-        smart_accounts_file=profile_home / "smart_accounts.json",
         using_legacy_profile_home=using_legacy_profile_home,
     )
 
 
 def ensure_layout(paths: VaultPaths) -> None:
-    paths.root_home.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(paths.root_home)
+    ensure_private_directory(paths.profiles_dir)
     if not paths.using_legacy_profile_home:
-        paths.home.mkdir(parents=True, exist_ok=True)
-    paths.accounts_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(paths.home)
+    ensure_private_directory(paths.accounts_dir)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -89,10 +93,42 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    ensure_private_directory(path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        set_private_mode(temporary_path, PRIVATE_FILE_MODE)
+        os.replace(temporary_path, path)
+        set_private_mode(path, PRIVATE_FILE_MODE)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    set_private_mode(path, PRIVATE_DIR_MODE)
+
+
+def set_private_mode(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        return
+
+
+def path_is_within_git_worktree(path: Path) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return True
+    return False
 
 
 def normalize_profile_name(profile: str) -> str:

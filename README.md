@@ -1,8 +1,8 @@
 # vault
 
-`vault` is a local-first EVM wallet CLI and TUI.
+`vault` is a local-first EVM wallet CLI and TUI for advanced terminal users.
 
-It manages accounts, networks, signing, sending, policy checks, journal storage, and smart-account workflows without turning into a general-purpose web3 automation platform.
+It keeps keys and state on disk, separates `dev`/`test`/`prod` profiles, supports watch-only accounts, and focuses on safe transaction operations, policy checks, and observable wallet activity.
 
 ## What It Does
 
@@ -11,20 +11,22 @@ It manages accounts, networks, signing, sending, policy checks, journal storage,
 - separates `dev`, `test`, and `prod` profiles
 - supports Alchemy presets, custom RPCs, and local Anvil networks
 - fetches native and ERC-20 balances
+- inspects addresses, token contracts, and generic contracts over RPC
+- reads from contracts and prepares/simulates/executes contract writes with explicit ABI input
 - signs messages and EIP-712 typed data
 - previews, simulates, signs, and broadcasts EOA transactions
 - applies outbound policy rules before protected actions
 - records local journal entries and receipts
-- registers Safe and ERC-4337 smart-account configs
+- monitors wallet activity and balance changes per account/network
 - provides a Textual TUI for daily terminal use
 
 ## What It Does Not Do
 
-- it is not a chain indexer
+- it is not a smart-account manager
 - it is not a bot runner or workflow engine
+- it is not a chain indexer
 - it is not portfolio or tax software
 - it is not a substitute for a hardware wallet for larger funds
-- it does not yet have live-validated Safe and ERC-4337 backend coverage for every provider combination
 
 ## Install
 
@@ -36,7 +38,7 @@ pip install -e .
 
 Profiles:
 
-- `dev`: local Anvil and disposable development work
+- `dev`: local Anvil and disposable work
 - `test`: public testnets like Sepolia
 - `prod`: real funds and intentional live actions
 
@@ -44,14 +46,8 @@ Rules:
 
 - keep real funds in `prod`
 - do daily development in `dev`
-- use `test` for public testnet integration
-- do not point the TUI at `prod` unless you mean to
+- use `test` for hosted RPC validation
 - use `vault safety status` before changing a mixed store
-
-Important:
-
-- existing legacy wallets under `~/.vault` are treated as `prod`
-- `vault` does not move legacy stores automatically
 - strong confirmation is required for protected send paths
 
 ## Storage
@@ -65,13 +61,13 @@ Each profile has its own store for:
 - address book
 - policy
 - journal
-- smart-account registry
+- monitor state
 - theme
 
-You can override the root with `VAULT_HOME`:
+You can override the root with `VAULT_HOME`, but keep it outside any git repo or synced project folder:
 
 ```bash
-export VAULT_HOME="$PWD/.vault-test"
+export VAULT_HOME="$HOME/.vault-dev"
 ```
 
 ## Quick Start
@@ -132,6 +128,7 @@ vault network add-alchemy --preset eth-mainnet --name mainnet
 vault network add-anvil --name local --set-default
 vault network add --name custom --rpc-url https://rpc.example --chain-id 1 --symbol ETH
 vault network list
+vault network use --name mainnet
 ```
 
 Address book:
@@ -146,6 +143,13 @@ Balances and send:
 
 ```bash
 vault balance --account main --network mainnet
+vault lookup address --target main --network mainnet
+vault lookup token --target 0xTOKEN --network mainnet --holder main
+vault lookup contract --target 0xCONTRACT --network mainnet
+vault contract read --target 0xCONTRACT --abi-file abi.json --function balanceOf --args "[\"0xabc...\"]"
+vault contract write preview --target 0xCONTRACT --from-account main --abi-file abi.json --function setValue --args "[1]"
+vault token allowance --token 0xTOKEN --owner main --spender router --network mainnet
+vault token approve preview --token 0xTOKEN --from-account main --spender router --amount 1 --network mainnet
 vault simulate --from-account main --network sepolia --to faucet --amount 0.01
 vault send --from-account main --network sepolia --to faucet --amount 0.01
 ```
@@ -167,46 +171,20 @@ vault policy explain --account main --network sepolia --to faucet --amount 0.01
 
 vault backup verify --account main
 vault journal list
-vault journal show --tx-hash 0x...
+vault journal show --id 0x...
 vault receipt show --tx-hash 0x...
 ```
 
-## Smart Accounts
-
-Safe:
+Monitoring:
 
 ```bash
-vault safe register \
-  --name team-safe \
-  --address 0xabc... \
-  --network mainnet \
-  --service-url https://safe-transaction-mainnet.safe.global
-
-vault smart-account list
-vault smart-account show --name team-safe
-vault safe pending --name team-safe
-vault safe tx --name team-safe --safe-tx-hash 0x...
+vault monitor show-state --account main --network sepolia
+vault monitor run --account main --network sepolia --once
+vault monitor run --account main --network sepolia --interval 10
+vault monitor list-events --account main --network sepolia --limit 20
 ```
 
-ERC-4337:
-
-```bash
-vault aa register \
-  --name session-account \
-  --sender 0xabc... \
-  --network sepolia \
-  --owner-account main \
-  --entrypoint 0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789 \
-  --bundler-url https://your-bundler.example
-
-vault aa prepare --name session-account --to 0xdef... --value 0 --data 0x
-```
-
-Current boundary:
-
-- Safe config and workflow support is built in
-- ERC-4337 config and user-operation workflow support is built in
-- those paths still need real-endpoint validation in your environment before you should trust them with production operations
+The monitor polls over HTTP RPC and writes observed activity into the journal. The journal is the single user-facing history view for both user-initiated sends and monitor-written events.
 
 ## TUI
 
@@ -224,11 +202,12 @@ Current TUI areas:
 - networks
 - address book
 - balance
+- lookup
+- contracts
 - send
-- smart-account registry
+- monitor
 - policy inspection and editing
 - journal inspection and receipt lookup
-- smart-account ops for Safe and ERC-4337
 
 ## Repository Hygiene
 
@@ -238,60 +217,27 @@ Never commit:
 - `.env` files
 - API keys
 - private keys
-- local bundler or service URLs that embed credentials
 
-The repo `.gitignore` is configured to keep local wallet state, backups, env files, and venvs out of git.
+Before publishing this repo:
+
+- keep `VAULT_HOME` outside the repository
+- run `vault safety status` and confirm there is no git-worktree storage warning
+- check `git status --ignored` for local wallet stores or backups
+- scan for obvious secrets before push, for example:
+
+```bash
+rg -n "(PRIVATE KEY|BEGIN [A-Z ]*PRIVATE KEY|MNEMONIC|API_KEY|SECRET|0x[a-fA-F0-9]{64})" .
+```
 
 ## Known Limits
 
 - no hardware-wallet integration yet
-- no Safe SDK dependency; Safe service and on-chain flows are implemented directly
-- no full provider matrix testing for ERC-4337
-- no bot, scheduler, or automation engine
+- monitoring is polling-based in v1
+- no websocket support
+- no explorer-backed labels, verified ABIs, or transaction history for arbitrary addresses
+- no explorer ABI fetching or signature inference for generic contract calls
 - no chain-wide analytics or portfolio indexing
-
-## Audit Status
-
-Verified in this repo:
-
-- unit test suite passes
-- package installs with `pip install -e .`
-- local Anvil flow works end to end:
-  - account import
-  - RPC health check
-  - balance lookup
-  - transaction simulation
-  - real local send
-  - journal write
-  - receipt lookup
-
-Fixed during audit:
-
-- Safe owner checks now compare owner addresses correctly
-- transaction hashes are normalized before journal storage
-- receipt hashes keep the `0x` prefix
-- signed hashes and signatures are emitted in normalized `0x` form
-- repo ignore rules now cover local wallet stores and env files
-
-Still treat as provisional until you validate them live:
-
-- Safe proposal / confirm / execute against your chosen Safe Transaction Service
-- ERC-4337 prepare / sign / simulate / submit / status against your chosen bundler
-
-Current known risks:
-
-- smart-account service and bundler URLs are stored and displayed as entered, so do not paste credential-bearing URLs
-- HTTP requests for Safe and ERC-4337 backends do not yet set explicit timeouts
-
-## Publish Checklist
-
-Before the first real commit or push:
-
-1. Run `git status --short --ignored` and confirm wallet stores are ignored.
-2. Confirm `.vault*`, `.env*`, and `venv/` are not staged.
-3. Do not commit any local wallet home or backup directory.
-4. Keep API keys in environment variables, not config files.
-5. Prefer `dev` or `test` for screenshots, demos, and recordings.
+- token-balance observation is limited to what can already be inferred from observed activity
 
 ## Recommended Workflow
 

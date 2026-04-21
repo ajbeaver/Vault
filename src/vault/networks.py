@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from vault.config import NotFoundError, ValidationError, VaultPaths, load_json, save_json
+from vault.evm import redact_rpc_url
 from vault.keystore import validate_name
 
 
@@ -234,6 +235,8 @@ class NetworkManager:
         row = dict(network)
         if row.get("provider") == "alchemy":
             row["rpc_url"] = row.pop("rpc_url_template")
+        if row.get("rpc_url"):
+            row["rpc_url"] = redact_rpc_url(str(row["rpc_url"]))
         return row
 
     def _network_response(self, network: dict[str, Any], default_network: str | None) -> dict[str, Any]:
@@ -262,6 +265,8 @@ def copy_network_record(
     row = dict(network)
     if row.get("provider") == "alchemy":
         row["rpc_url"] = row["rpc_url_template"]
+    if row.get("rpc_url"):
+        row["rpc_url"] = redact_rpc_url(str(row["rpc_url"]))
     return row
 
 

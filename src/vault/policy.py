@@ -109,6 +109,13 @@ class PolicyManager:
                     f"Native amount {amount} exceeds policy max {policy['max_native_amount']}."
                 )
 
+        if asset_type == "contract" and policy["max_native_amount"] is not None and Decimal(amount) > Decimal("0"):
+            if Decimal(amount) > Decimal(policy["max_native_amount"]):
+                allowed = False
+                findings.append(
+                    f"Contract write value {amount} exceeds policy max {policy['max_native_amount']}."
+                )
+
         if asset_type == "erc20" and token_address:
             token_key = normalize_address(token_address)
             token_cap = policy["max_token_amounts"].get(token_key)
