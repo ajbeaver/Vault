@@ -1,8 +1,22 @@
 # vault
 
-`vault` is a local-first EVM wallet CLI and TUI for advanced terminal users.
+<p align="center">
+  <img src=".github/assets/logo.png" alt="Vault logo" width="160">
+</p>
+
+`vault` is a local-first EVM wallet CLI and TUI.
 
 It keeps keys and state on disk, separates `dev`/`test`/`prod` profiles, supports watch-only accounts, and focuses on safe transaction operations, policy checks, and observable wallet activity.
+
+## Overview
+
+Vault is a terminal wallet for EVM networks with a local-first safety model.
+
+- isolated `dev`, `test`, and `prod` profiles
+- encrypted local keystore storage
+- contract inspection, reads, and guarded writes
+- transaction preview, simulation, journal, and monitoring
+- CLI and TUI surfaces over the same service layer
 
 ## What It Does
 
@@ -23,7 +37,7 @@ It keeps keys and state on disk, separates `dev`/`test`/`prod` profiles, support
 ## What It Does Not Do
 
 - it is not a smart-account manager
-- it is not a bot runner or workflow engine
+- it is not a general automation platform
 - it is not a chain indexer
 - it is not portfolio or tax software
 - it is not a substitute for a hardware wallet for larger funds
@@ -208,6 +222,14 @@ Current TUI areas:
 - monitor
 - policy inspection and editing
 - journal inspection and receipt lookup
+
+## Screenshots
+
+![Main TUI view](.github/assets/screenshot-main.png)
+
+![Monitor view](.github/assets/screenshot-monitor.png)
+
+![Lookup view](.github/assets/screenshot-lookup.png)
 
 ## Repository Hygiene
 

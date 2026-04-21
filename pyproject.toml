@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "vault-cli"
 version = "0.1.0"
 description = "Terminal wallet manager for Ethereum-compatible networks"
+authors = [
+  {name = "ajbeaver"},
+]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
