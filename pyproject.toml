@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vault-cli"
+version = "0.1.0"
+description = "Terminal wallet manager for Ethereum-compatible networks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=42.0.0",
+  "textual>=0.61.0",
+  "web3>=7.0.0",
+]
+
+[project.scripts]
+vault = "vault.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
