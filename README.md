@@ -231,26 +231,6 @@ Current TUI areas:
 
 ![Lookup view](.github/assets/screenshot-lookup.png)
 
-## Repository Hygiene
-
-Never commit:
-
-- wallet stores like `.vault`, `.vault-test`, or backups
-- `.env` files
-- API keys
-- private keys
-
-Before publishing this repo:
-
-- keep `VAULT_HOME` outside the repository
-- run `vault safety status` and confirm there is no git-worktree storage warning
-- check `git status --ignored` for local wallet stores or backups
-- scan for obvious secrets before push, for example:
-
-```bash
-rg -n "(PRIVATE KEY|BEGIN [A-Z ]*PRIVATE KEY|MNEMONIC|API_KEY|SECRET|0x[a-fA-F0-9]{64})" .
-```
-
 ## Known Limits
 
 - no hardware-wallet integration yet
@@ -261,9 +241,3 @@ rg -n "(PRIVATE KEY|BEGIN [A-Z ]*PRIVATE KEY|MNEMONIC|API_KEY|SECRET|0x[a-fA-F0-
 - no chain-wide analytics or portfolio indexing
 - token-balance observation is limited to what can already be inferred from observed activity
 
-## Recommended Workflow
-
-1. Build and debug in `dev` with Anvil.
-2. Validate hosted RPC behavior in `test`.
-3. Use `prod` only for intentional real-fund operations.
-4. Keep wallet homes and backups out of git.
