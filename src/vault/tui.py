@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     Button,
     Footer,
@@ -48,6 +48,7 @@ class VaultTUI(App[None]):
       width: 36;
       min-width: 30;
       padding: 1;
+      overflow-y: auto;
       border: round $accent;
       background: $panel;
     }
@@ -55,6 +56,7 @@ class VaultTUI(App[None]):
     #main {
       width: 1fr;
       padding: 1;
+      overflow-y: auto;
     }
 
     #context_bar {
@@ -98,6 +100,7 @@ class VaultTUI(App[None]):
       min-width: 30;
       margin-right: 1;
       padding: 1;
+      overflow-y: auto;
       border: round $surface-lighten-1;
       background: $boost;
     }
@@ -105,6 +108,7 @@ class VaultTUI(App[None]):
     .detail-column {
       width: 1fr;
       padding: 1;
+      overflow-y: auto;
       border: round $surface-lighten-1;
       background: $boost;
     }
@@ -124,6 +128,7 @@ class VaultTUI(App[None]):
     }
 
     .form-block {
+      height: auto;
       margin-top: 1;
       padding-top: 1;
       border-top: tall $surface-lighten-1;
@@ -147,6 +152,7 @@ class VaultTUI(App[None]):
       min-width: 36;
       margin-right: 1;
       padding: 1;
+      overflow-y: auto;
       border: round $surface-lighten-1;
       background: $boost;
     }
@@ -154,6 +160,7 @@ class VaultTUI(App[None]):
     .send-preview-column {
       width: 1fr;
       padding: 1;
+      overflow-y: auto;
       border: round $surface-lighten-1;
       background: $boost;
     }
@@ -188,6 +195,11 @@ class VaultTUI(App[None]):
 
     TabbedContent {
       height: 1fr;
+    }
+
+    TabPane {
+      height: 1fr;
+      overflow-y: auto;
     }
     """
 
@@ -237,7 +249,7 @@ class VaultTUI(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="top"):
-            with Vertical(id="sidebar"):
+            with VerticalScroll(id="sidebar"):
                 yield Static("", id="status_profile", classes="status-card")
                 yield Static("", id="status_account", classes="status-card")
                 yield Static("", id="status_network", classes="status-card")
@@ -253,7 +265,7 @@ class VaultTUI(App[None]):
                 with Horizontal(classes="quick-row"):
                     yield Button("Theme -", id="theme_prev_button")
                     yield Button("Theme +", id="theme_next_button")
-            with Vertical(id="main"):
+            with VerticalScroll(id="main"):
                 yield Static("", id="context_bar")
                 with TabbedContent(id="tabs"):
                     with TabPane("Profiles", id="tab_profiles"):
@@ -261,7 +273,7 @@ class VaultTUI(App[None]):
                             with Vertical(classes="list-column"):
                                 yield Label("Profiles", classes="section-title")
                                 yield ListView(id="profiles_list")
-                            with Vertical(classes="detail-column"):
+                            with VerticalScroll(classes="detail-column"):
                                 yield Label("Profile Detail", classes="section-title")
                                 yield Static("", id="profiles_detail", classes="detail-panel")
                                 with Horizontal(classes="form-actions"):
@@ -272,7 +284,7 @@ class VaultTUI(App[None]):
                             with Vertical(classes="list-column"):
                                 yield Label("Accounts", classes="section-title")
                                 yield ListView(id="accounts_list")
-                            with Vertical(classes="detail-column"):
+                            with VerticalScroll(classes="detail-column"):
                                 yield Label("Account Detail", classes="section-title")
                                 yield Static("", id="accounts_detail", classes="detail-panel")
                                 with Horizontal(classes="form-actions"):
@@ -297,7 +309,7 @@ class VaultTUI(App[None]):
                             with Vertical(classes="list-column"):
                                 yield Label("Networks", classes="section-title")
                                 yield ListView(id="networks_list")
-                            with Vertical(classes="detail-column"):
+                            with VerticalScroll(classes="detail-column"):
                                 yield Label("Network Detail", classes="section-title")
                                 yield Static("", id="networks_detail", classes="detail-panel")
                                 with Horizontal(classes="form-actions"):
@@ -322,7 +334,7 @@ class VaultTUI(App[None]):
                             with Vertical(classes="list-column"):
                                 yield Label("Address Book", classes="section-title")
                                 yield ListView(id="book_list")
-                            with Vertical(classes="detail-column"):
+                            with VerticalScroll(classes="detail-column"):
                                 yield Label("Recipient Detail", classes="section-title")
                                 yield Static("", id="book_detail", classes="detail-panel")
                                 with Horizontal(classes="form-actions"):
@@ -338,7 +350,7 @@ class VaultTUI(App[None]):
 
                     with TabPane("Balance", id="tab_balance"):
                         with Horizontal(classes="send-layout"):
-                            with Vertical(classes="send-form-column"):
+                            with VerticalScroll(classes="send-form-column"):
                                 yield Label("Selected wallet snapshot", classes="section-title")
                                 yield Input(placeholder="Account name (blank = default)", id="balance_account")
                                 yield Input(placeholder="Network name (blank = default)", id="balance_network")
@@ -346,13 +358,13 @@ class VaultTUI(App[None]):
                                 with Horizontal(classes="form-actions"):
                                     yield Button("Fetch Balance", id="balance_button", variant="primary")
                                     yield Button("Use Defaults", id="balance_defaults_button")
-                            with Vertical(classes="send-preview-column"):
+                            with VerticalScroll(classes="send-preview-column"):
                                 yield Label("Balance Snapshot", classes="section-title")
                                 yield Static("", id="balance_snapshot_view", classes="balance-panel")
 
                     with TabPane("Send", id="tab_send"):
                         with Horizontal(classes="send-layout"):
-                            with Vertical(classes="send-form-column"):
+                            with VerticalScroll(classes="send-form-column"):
                                 yield Label("Transaction Form", classes="section-title")
                                 yield Input(placeholder="From account (blank = default)", id="send_account")
                                 yield Input(placeholder="Network (blank = default)", id="send_network")
@@ -371,7 +383,7 @@ class VaultTUI(App[None]):
                                     yield Input(placeholder="Confirmation text", id="send_confirmation")
                                     yield Input(placeholder="Retype amount for protected sends", id="send_amount_confirm")
                                     yield Button("Broadcast", id="send_broadcast_button", variant="error")
-                            with Vertical(classes="send-preview-column"):
+                            with VerticalScroll(classes="send-preview-column"):
                                 yield Label("Preview", classes="section-title")
                                 yield Static("", id="send_preview_view", classes="preview-panel")
                                 yield Label("Result", classes="section-title")
@@ -382,7 +394,7 @@ class VaultTUI(App[None]):
                             with Vertical(classes="list-column"):
                                 yield Label("Smart Accounts", classes="section-title")
                                 yield ListView(id="smart_list")
-                            with Vertical(classes="detail-column"):
+                            with VerticalScroll(classes="detail-column"):
                                 yield Label("Smart Account Detail", classes="section-title")
                                 yield Static("", id="smart_detail", classes="detail-panel")
                                 with Horizontal(classes="form-actions"):
@@ -411,7 +423,7 @@ class VaultTUI(App[None]):
 
                     with TabPane("Policy", id="tab_policy"):
                         with Horizontal(classes="send-layout"):
-                            with Vertical(classes="send-form-column"):
+                            with VerticalScroll(classes="send-form-column"):
                                 yield Label("Policy Controls", classes="section-title")
                                 yield Input(placeholder="Scope account (blank = profile)", id="policy_scope_account")
                                 with Horizontal(classes="form-actions"):
@@ -431,7 +443,7 @@ class VaultTUI(App[None]):
                                     yield Input(placeholder="Amount", id="policy_explain_amount")
                                     yield Input(placeholder="Token address (optional)", id="policy_explain_token")
                                     yield Button("Explain", id="policy_explain_button")
-                            with Vertical(classes="send-preview-column"):
+                            with VerticalScroll(classes="send-preview-column"):
                                 yield Label("Effective Policy", classes="section-title")
                                 yield Static("", id="policy_view", classes="preview-panel")
                                 yield Label("Evaluation", classes="section-title")
@@ -442,7 +454,7 @@ class VaultTUI(App[None]):
                             with Vertical(classes="list-column"):
                                 yield Label("Journal", classes="section-title")
                                 yield ListView(id="journal_list")
-                            with Vertical(classes="detail-column"):
+                            with VerticalScroll(classes="detail-column"):
                                 yield Label("Journal Detail", classes="section-title")
                                 yield Static("", id="journal_detail", classes="detail-panel")
                                 with Horizontal(classes="form-actions"):
@@ -456,7 +468,7 @@ class VaultTUI(App[None]):
 
                     with TabPane("Ops", id="tab_ops"):
                         with Horizontal(classes="send-layout"):
-                            with Vertical(classes="send-form-column"):
+                            with VerticalScroll(classes="send-form-column"):
                                 yield Label("Smart Account Ops", classes="section-title")
                                 yield Input(placeholder="Smart account (blank = default)", id="ops_smart_name")
                                 yield Input(placeholder="Signer account", id="ops_signer_account")
@@ -490,7 +502,7 @@ class VaultTUI(App[None]):
                                     with Horizontal(classes="form-actions"):
                                         yield Button("Submit", id="ops_aa_submit_button", variant="error")
                                         yield Button("Status", id="ops_aa_status_button")
-                            with Vertical(classes="send-preview-column"):
+                            with VerticalScroll(classes="send-preview-column"):
                                 yield Label("Ops Output", classes="section-title")
                                 yield Static("", id="ops_result_view", classes="preview-panel")
         yield RichLog(id="log_view", wrap=True, highlight=True)
@@ -736,17 +748,18 @@ class VaultTUI(App[None]):
         list_view.clear()
         items = [item_builder(row) for row in rows]
         list_view.extend(items)
-        self.call_after_refresh(self.sync_list_selection, list_id, rows, preferred_name)
+        identities = [item.entity_name for item in items if isinstance(item, EntityListItem)]
+        self.call_after_refresh(self.sync_list_selection, list_id, identities, preferred_name)
 
-    def sync_list_selection(self, list_id: str, rows: list[dict[str, Any]], preferred_name: str | None) -> None:
+    def sync_list_selection(self, list_id: str, identities: list[str], preferred_name: str | None) -> None:
         list_view = self.query_one(f"#{list_id}", ListView)
-        if not rows:
+        if not identities:
             list_view.index = None
             return
         index = 0
         if preferred_name:
-            for idx, row in enumerate(rows):
-                if row["name"] == preferred_name:
+            for idx, identity in enumerate(identities):
+                if identity == preferred_name:
                     index = idx
                     break
         list_view.index = index

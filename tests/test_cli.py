@@ -9,13 +9,17 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from textual.containers import VerticalScroll
+
 from vault.address_book import AddressBookManager
 from vault.cli import build_parser, launch_ui
 from vault.config import VaultError, resolve_paths, save_json, set_active_profile_name
 from vault.evm import redact_rpc_url
+from vault.journal import JournalManager
 from vault.networks import NetworkManager
 from vault.output import format_human
 from vault.service import VaultService
+from vault.tui import VaultTUI
 
 
 class ParserTests(unittest.TestCase):
@@ -196,6 +200,75 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(args.command, "smart-account")
         self.assertEqual(args.smart_account_command, "use")
         self.assertEqual(args.name, "team-safe")
+
+
+class TUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_mount_with_journal_entries_keeps_selection_by_tx_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = JournalManager(resolve_paths(temp_dir))
+            entry = manager.record_event(
+                "0xdaabb2afd23fda3cab2b7649da771d08eb3a8c6cb36b019c9381246f123eafa9",
+                "send",
+                {
+                    "status": "submitted",
+                    "profile": "dev",
+                    "network": "local",
+                    "chain_id": 31337,
+                    "account_name": "local-dev",
+                    "from_address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                    "to_address": "0x1111111111111111111111111111111111111111",
+                    "amount": "1",
+                    "created_at": "2026-04-21T05:12:46+00:00",
+                    "receipt": None,
+                },
+            )
+
+            app = VaultTUI(home=temp_dir)
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                journal_list = app.query_one("#journal_list")
+                self.assertEqual(journal_list.index, 0)
+                self.assertEqual(app.selected_journal_hash, entry["tx_hash"])
+
+    async def test_scrollable_layout_containers_allow_vertical_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = VaultTUI(home=temp_dir)
+            async with app.run_test(size=(140, 40)) as pilot:
+                scrollable_selectors = [
+                    "#sidebar",
+                    "#main",
+                    ".detail-column",
+                    ".send-form-column",
+                    ".send-preview-column",
+                ]
+                for selector in scrollable_selectors:
+                    widgets = list(app.query(selector))
+                    self.assertGreater(len(widgets), 0, selector)
+                    for widget in widgets:
+                        self.assertIsInstance(widget, VerticalScroll, selector)
+                        self.assertEqual(widget.styles.overflow_y, "auto", selector)
+
+                tab_panes = list(app.query("TabPane"))
+                self.assertGreater(len(tab_panes), 0, "TabPane")
+                for widget in tab_panes:
+                    self.assertEqual(str(widget.styles.height), "1fr", "TabPane")
+                    self.assertEqual(widget.styles.overflow_y, "auto", "TabPane")
+
+                app.action_show_accounts()
+                await pilot.pause()
+
+                active_detail = [
+                    widget for widget in app.query(".detail-column") if widget.display and widget.size.height > 0
+                ][0]
+                self.assertGreater(active_detail.max_scroll_y, 0)
+
+                visible_form_blocks = [
+                    widget for widget in app.query(".form-block") if widget.display and widget.virtual_size.height > 0
+                ]
+                self.assertGreater(len(visible_form_blocks), 0)
+                for widget in visible_form_blocks:
+                    self.assertEqual(str(widget.styles.height), "auto", ".form-block")
+                    self.assertGreater(widget.size.height, 0)
 
 
 class NetworkStoreTests(unittest.TestCase):
