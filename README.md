@@ -105,7 +105,6 @@ Using a local Anvil network:
 
 ```bash
 vault profile use --name dev
-anvil
 
 vault network add-anvil --name local --set-default
 vault account import --name local-dev --private-key 0xANVIL_PRIVATE_KEY --set-default
