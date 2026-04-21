@@ -4,13 +4,13 @@
   <img src=".github/assets/logo.png" alt="Vault logo" width="160">
 </p>
 
-`vault` is a local-first EVM wallet CLI and TUI.
+Vault is a local-first EVM execution and wallet CLI/TUI focused on safe, observable transaction workflows.
 
 It keeps keys and state on disk, separates `dev`/`test`/`prod` profiles, supports watch-only accounts, and focuses on safe transaction operations, policy checks, and observable wallet activity.
 
 ## Overview
 
-Vault is a terminal wallet for EVM networks with a local-first safety model.
+Vault treats wallet actions as explicit, inspectable operations with enforced safety boundaries and local state.
 
 - isolated `dev`, `test`, and `prod` profiles
 - encrypted local keystore storage
@@ -30,13 +30,13 @@ Vault is a terminal wallet for EVM networks with a local-first safety model.
 - signs messages and EIP-712 typed data
 - previews, simulates, signs, and broadcasts EOA transactions
 - applies outbound policy rules before protected actions
-- records local journal entries and receipts
+- records all actions and observed activity into a unified local journal
 - monitors wallet activity and balance changes per account/network
 - provides a Textual TUI for daily terminal use
 
 ## What It Does Not Do
 
-- it is not a smart-account manager
+- it does not manage account abstraction or smart-account lifecycles
 - it is not a general automation platform
 - it is not a chain indexer
 - it is not portfolio or tax software
@@ -88,7 +88,7 @@ export VAULT_HOME="$HOME/.vault-dev"
 
 ## Quick Start
 
-Alchemy:
+Using Alchemy (public RPC):
 
 ```bash
 export ALCHEMY_API_KEY="your-api-key"
@@ -101,7 +101,7 @@ vault account create --name main --set-default
 vault balance --account main --network sepolia
 ```
 
-Local Anvil:
+Using a local Anvil network:
 
 ```bash
 vault profile use --name dev
@@ -190,6 +190,8 @@ vault journal list
 vault journal show --id 0x...
 vault receipt show --tx-hash 0x...
 ```
+
+The journal is the canonical local history for all wallet activity, including user actions and observed network events.
 
 Monitoring:
 
